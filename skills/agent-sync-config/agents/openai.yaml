@@ -1,0 +1,4 @@
+interface:
+  display_name: "Agent Sync Config"
+  short_description: "Share and sync Codex and Claude configuration"
+  default_prompt: "Use $agent-sync-config to check and synchronize this repository's shared agent configuration."

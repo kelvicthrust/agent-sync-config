@@ -1,0 +1,1014 @@
+#!/usr/bin/env python3
+"""Share local agent configuration without overwriting conflicting content."""
+from __future__ import annotations
+
+import argparse
+import copy
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+from contextlib import contextmanager
+
+sys.dont_write_bytecode = True
+
+VERSION = "0.1.0"
+NAME = "agent-sync-config"
+SCHEMA = 1
+SKILL = Path(__file__).resolve().parents[1]
+BEGIN = "<!-- agent-sync-config:start -->"
+END = "<!-- agent-sync-config:end -->"
+GUIDANCE = f"""{BEGIN}
+## Shared agent configuration
+
+This repository uses agent-sync-config to share instructions, skills, curated
+context, and MCP configuration across Codex and Claude Code.
+
+Use the agent-sync-config skill after changing shared configuration, when hooks
+report drift or conflicts, or when switching clients without an automatic check.
+Claude Code: /agent-sync-config. Codex CLI/IDE: $agent-sync-config.
+Codex desktop: select agent-sync-config with @.
+
+For read-only verification, run `agent-sync-config check` from this repository.
+Edit shared instructions here, skills in `.agents/skills/`, context in
+`.agents/context/`, and MCP definitions in `.agents/mcp.json`.
+Preserve conflicting content and reconcile it before syncing. References to the
+skill do not install it; automatic checks require enabled, trusted hooks.
+{END}
+"""
+ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+ENV_REF = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$")
+CREDENTIAL = re.compile(r"token|password|secret|api[_-]?key", re.I)
+SKILL_NAME = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+
+
+class ConfigError(Exception):
+    pass
+
+
+def exists(path: Path) -> bool:
+    return os.path.lexists(path)
+
+
+def read_json(path: Path, default=None):
+    if not exists(path):
+        return copy.deepcopy(default)
+    try:
+        value = json.loads(path.read_text())
+    except (OSError, ValueError) as exc:
+        raise ConfigError(f"Cannot read JSON: {path} ({type(exc).__name__})") from exc
+    if not isinstance(value, dict):
+        raise ConfigError(f"Expected a JSON object: {path}")
+    return value
+
+
+def json_text(value) -> str:
+    return json.dumps(value, indent=2, ensure_ascii=False, sort_keys=True) + "\n"
+
+
+def digest(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def tree_digest(path: Path) -> str:
+    """Used only during explicit adoption/installation, never warm prompt checks."""
+    h = hashlib.sha256()
+    for item in sorted(path.rglob("*")):
+        if "__pycache__" in item.parts or item.suffix == ".pyc":
+            continue
+        h.update(str(item.relative_to(path)).encode())
+        if item.is_symlink():
+            h.update(os.readlink(item).encode())
+        elif item.is_file():
+            h.update(item.read_bytes())
+    return h.hexdigest()
+
+
+def validate_links(records: dict, personal: bool = False):
+    roots = {".claude/skills", ".codex/skills"}
+    if personal:
+        roots.add(".agents/skills")
+    instructions = {".codex/AGENTS.md", ".claude/CLAUDE.md"} if personal else {".claude/context", ".codex/context"}
+    for key, value in records.items():
+        path = Path(key)
+        valid_skill = str(path.parent) in roots and SKILL_NAME.fullmatch(path.name)
+        if not isinstance(value, str) or not (valid_skill or key in instructions):
+            raise ConfigError("Invalid managed link path; preserve the manifest and reconcile it")
+
+
+def portable_skill(source: Path):
+    if not SKILL_NAME.fullmatch(source.name) or not (source / "SKILL.md").is_file():
+        raise ConfigError("Skill directory needs a lowercase hyphenated name and SKILL.md")
+    for path in source.rglob("*"):
+        if path.is_symlink():
+            raise ConfigError("Skill contains dependency symlinks; make it self-contained before adoption")
+        if path.is_file() and path.suffix != ".pyc":
+            data = path.read_bytes()
+            if re.search(rb"\$\{?(?:CLAUDE_)?PLUGIN_(?:ROOT|DATA)", data):
+                raise ConfigError("Skill depends on plugin runtime paths; adapt dependencies before adoption")
+
+
+def toml_module():
+    vendor = str(Path(__file__).resolve().parent / "vendor")
+    if vendor not in sys.path:
+        sys.path.insert(0, vendor)
+    import tomlkit
+    return tomlkit
+
+
+def read_toml(path: Path):
+    tk = toml_module()
+    try:
+        return tk.parse(path.read_text()) if exists(path) else tk.document()
+    except (OSError, ValueError) as exc:
+        raise ConfigError(f"Cannot read TOML: {path} ({type(exc).__name__})") from exc
+
+
+def plain(value):
+    return value.unwrap() if hasattr(value, "unwrap") else value
+
+
+def update_toml_table(table, desired):
+    """Change owned keys in place so tomlkit retains surrounding comments."""
+    for key in list(table):
+        if key not in desired:
+            del table[key]
+    for key, value in desired.items():
+        if isinstance(value, dict) and key in table and isinstance(plain(table[key]), dict):
+            update_toml_table(table[key], value)
+        else:
+            table[key] = value
+
+
+def root_for(path: Path) -> Path:
+    """Walk to the worktree root without spawning git on every prompt."""
+    path = path.expanduser().resolve()
+    if not path.is_dir():
+        raise ConfigError(f"Project directory does not exist: {path}")
+    for candidate in (path, *path.parents):
+        if exists(candidate / ".git"):
+            return candidate
+    for candidate in (path, *path.parents):
+        if (candidate / ".agents/agent-sync.json").is_file():
+            return candidate
+    return path
+
+
+def strip_guidance(text: str) -> str:
+    if text.count(BEGIN) != text.count(END) or text.count(BEGIN) > 1:
+        raise ConfigError("Malformed agent-sync-config instruction markers")
+    if BEGIN in text:
+        start, finish = text.index(BEGIN), text.index(END) + len(END)
+        if finish < start:
+            raise ConfigError("Reversed agent-sync-config instruction markers")
+        return (text[:start] + text[finish:]).strip()
+    return text.strip()
+
+
+def add_guidance(text: str) -> str:
+    strip_guidance(text)  # validate markers before editing
+    if BEGIN in text:
+        start, finish = text.index(BEGIN), text.index(END) + len(END)
+        return text[:start] + GUIDANCE.rstrip() + text[finish:]
+    return text.rstrip() + "\n\n" + GUIDANCE
+
+
+def validate_server(server: dict) -> dict:
+    allowed = {"transport", "command", "args", "cwd", "env", "env_vars", "url",
+               "headers", "env_headers", "bearer_token_env_var"}
+    if not isinstance(server, dict) or set(server) - allowed:
+        raise ConfigError("Unsupported shared MCP fields; preserve provider-specific options separately")
+    result = copy.deepcopy(server)
+    transport = result.get("transport")
+    if transport not in ("stdio", "http"):
+        raise ConfigError("MCP transport must be stdio or http")
+    required = "command" if transport == "stdio" else "url"
+    if not isinstance(result.get(required), str) or not result[required]:
+        raise ConfigError(f"MCP {required} must be a nonempty string")
+    if transport == "stdio" and set(result) & {"url", "headers", "env_headers", "bearer_token_env_var"}:
+        raise ConfigError("HTTP-only fields on a stdio MCP server")
+    if transport == "http" and set(result) & {"command", "args", "cwd", "env", "env_vars"}:
+        raise ConfigError("Stdio-only fields on an HTTP MCP server")
+    for key in ("cwd", "bearer_token_env_var"):
+        if key in result and not isinstance(result[key], str):
+            raise ConfigError(f"MCP {key} must be a string")
+    for key in ("args", "env_vars"):
+        if key in result and (not isinstance(result[key], list) or
+                              not all(isinstance(x, str) for x in result[key])):
+            raise ConfigError(f"MCP {key} must be a list of strings")
+    for key in ("env", "headers", "env_headers"):
+        if key in result and (not isinstance(result[key], dict) or
+                              not all(isinstance(v, str) for v in result[key].values())):
+            raise ConfigError(f"MCP {key} must map names to strings")
+    for value in [result.get("command", ""), result.get("url", ""), result.get("cwd", ""), *result.get("args", [])]:
+        if "${" in value:
+            raise ConfigError("Provider-specific interpolation in MCP paths/URLs is not portable; use literal paths/URLs")
+    names = result.get("env_vars", []) + list(result.get("env_headers", {}).values())
+    if "bearer_token_env_var" in result:
+        names.append(result["bearer_token_env_var"])
+    if any(not ENV_NAME.fullmatch(name) for name in names):
+        raise ConfigError("Invalid MCP environment variable name")
+    if set(result.get("env", {})) & set(result.get("env_vars", [])):
+        raise ConfigError("MCP env and env_vars overlap")
+    if set(result.get("headers", {})) & set(result.get("env_headers", {})):
+        raise ConfigError("MCP headers and env_headers overlap")
+    if "bearer_token_env_var" in result and "authorization" in {
+            key.lower() for key in list(result.get("headers", {})) + list(result.get("env_headers", {}))}:
+        raise ConfigError("MCP Authorization header and bearer token overlap")
+    for key, value in result.get("env", {}).items():
+        if CREDENTIAL.search(key) or "${" in value:
+            raise ConfigError("Use env_vars for credentials/interpolation; env is for literal nonsecret values")
+    for key, value in result.get("headers", {}).items():
+        if key.lower() == "authorization" or CREDENTIAL.search(key) or "${" in value:
+            raise ConfigError("Use env_headers or bearer_token_env_var for credential headers")
+    return {k: v for k, v in result.items() if v not in ({}, [])}
+
+
+def render_server(server: dict, provider: str) -> dict:
+    server = validate_server(server)
+    out = {k: copy.deepcopy(v) for k, v in server.items()
+           if k not in {"transport", "env_vars", "headers", "env_headers", "bearer_token_env_var"}}
+    if provider == "codex":
+        for key in ("env_vars", "bearer_token_env_var"):
+            if key in server:
+                out[key] = server[key]
+        if server.get("headers"):
+            out["http_headers"] = server["headers"]
+        if server.get("env_headers"):
+            out["env_http_headers"] = server["env_headers"]
+    else:
+        out["type"] = server["transport"]
+        if "cwd" in out:
+            raise ConfigError("Claude project MCP has no portable cwd field; use absolute command/argument paths")
+        env = out.setdefault("env", {})
+        env.update({name: "${" + name + "}" for name in server.get("env_vars", [])})
+        headers = copy.deepcopy(server.get("headers", {}))
+        headers.update({key: "${" + name + "}" for key, name in server.get("env_headers", {}).items()})
+        if "bearer_token_env_var" in server:
+            headers["Authorization"] = "Bearer ${" + server["bearer_token_env_var"] + "}"
+        if headers:
+            out["headers"] = headers
+        if not env:
+            del out["env"]
+    return out
+
+
+def import_server(native: dict, provider: str) -> dict:
+    native = plain(native)
+    if not isinstance(native, dict):
+        raise ConfigError("MCP definition must be an object")
+    if provider == "codex":
+        out = copy.deepcopy(native)
+        out["transport"] = "http" if "url" in out else "stdio"
+        if "http_headers" in out:
+            out["headers"] = out.pop("http_headers")
+        if "env_http_headers" in out:
+            out["env_headers"] = out.pop("env_http_headers")
+    else:
+        out = copy.deepcopy(native)
+        out["transport"] = out.pop("type", "http" if "url" in out else "stdio")
+        inherited = []
+        for key, value in list(out.get("env", {}).items()):
+            match = ENV_REF.fullmatch(value) if isinstance(value, str) else None
+            if match:
+                if key != match[1]:
+                    raise ConfigError("Aliased MCP environment variables are not portable to Codex")
+                inherited.append(key)
+                del out["env"][key]
+        if inherited:
+            out["env_vars"] = inherited
+        for key, value in list(out.get("headers", {}).items()):
+            bearer = re.fullmatch(r"Bearer \$\{([A-Za-z_][A-Za-z0-9_]*)\}", value) if isinstance(value, str) else None
+            match = ENV_REF.fullmatch(value) if isinstance(value, str) else None
+            if key.lower() == "authorization" and bearer:
+                out["bearer_token_env_var"] = bearer[1]
+                del out["headers"][key]
+            elif match:
+                out.setdefault("env_headers", {})[key] = match[1]
+                del out["headers"][key]
+    return validate_server(out)
+
+
+class Sync:
+    def __init__(self, home: Path, root: Path, apply: bool, personal: Path | None = None,
+                 project_only: bool = False, hook: bool = False):
+        self.home, self.root, self.apply = home, root, apply
+        self.project_only, self.hook = project_only, hook
+        self.state_dir = home / ".local/state/agent-sync-config"
+        self.registry_path = self.state_dir / "registry.json"
+        self.registry = read_json(self.registry_path, {"schema": SCHEMA, "projects": {}})
+        if self.registry.get("schema") != SCHEMA or not isinstance(self.registry.get("projects"), dict):
+            raise ConfigError("Unsupported machine registry")
+        registered = self.registry.get("personal_root")
+        if personal and registered and personal.resolve() != Path(registered).resolve():
+            raise ConfigError("Personal root already registered; migrate it explicitly rather than creating a second source")
+        self.personal = personal or (Path(registered) if registered else home / "agent-config")
+        self.personal = self.personal.expanduser().resolve()
+        self.issues: list[str] = []
+        self.changes: list[str] = []
+        self.notes: list[str] = []
+        self.old = read_json(root / ".agents/agent-sync.json", None)
+        if self.old is not None and (self.old.get("schema") != SCHEMA or
+                                     not isinstance(self.old.get("links"), dict) or
+                                     not isinstance(self.old.get("mcp"), dict)):
+            raise ConfigError("Unsupported project manifest; do not overwrite it")
+        self.manifest = copy.deepcopy(self.old) if self.old is not None else {
+            "schema": SCHEMA, "links": {}, "mcp": {}, "instructions": {}}
+        validate_links(self.manifest["links"])
+
+    def safe_parent(self, path: Path):
+        bases = sorted((self.root, self.personal, self.home), key=lambda item: len(item.parts), reverse=True)
+        for base in bases:
+            if path.is_relative_to(base):
+                for parent in path.parents:
+                    if parent == base:
+                        break
+                    if parent.is_symlink():
+                        raise ConfigError(f"Refusing to write through a linked configuration directory: {parent}")
+                return
+
+    def issue(self, message: str):
+        if message not in self.issues:
+            self.issues.append(message)
+
+    def changed(self, message: str):
+        if message not in self.changes:
+            self.changes.append(message)
+
+    def backup(self, path: Path):
+        if not exists(path):
+            return
+        identifier = digest(str(path).encode())[:16]
+        fingerprint = (digest(os.readlink(path).encode()) if path.is_symlink() else
+                       tree_digest(path) if path.is_dir() else digest(path.read_bytes()))
+        dest = self.state_dir / "backups" / identifier / fingerprint
+        if exists(dest):
+            return
+        dest.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if path.is_symlink():
+            dest.symlink_to(os.readlink(path))
+        elif path.is_dir():
+            shutil.copytree(path, dest, symlinks=True)
+        else:
+            shutil.copy2(path, dest)
+            dest.chmod(0o600)
+
+    def write(self, path: Path, text: str, mode: int | None = None):
+        self.safe_parent(path)
+        if exists(path) and path.is_file() and path.read_text() == text:
+            if mode is not None and path.stat().st_mode & 0o777 != mode:
+                self.changed(f"Set permissions: {path}")
+                if self.apply:
+                    path.chmod(mode)
+            return
+        self.changed(f"Update: {path}")
+        if not self.apply:
+            return
+        if path.is_symlink():
+            raise ConfigError(f"Refusing to replace a configuration symlink: {path}")
+        self.backup(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as stream:
+            temp = Path(stream.name)
+            stream.write(text.encode())
+        try:
+            temp.chmod(mode if mode is not None else path.stat().st_mode & 0o777 if path.exists() else 0o644)
+            os.replace(temp, path)
+        finally:
+            temp.unlink(missing_ok=True)
+
+    def mkdir(self, path: Path):
+        self.safe_parent(path)
+        if path.is_dir() and not path.is_symlink():
+            return
+        if exists(path):
+            raise ConfigError(f"Expected an ordinary directory: {path}")
+        self.changed(f"Create directory: {path}")
+        if self.apply:
+            path.mkdir(parents=True, exist_ok=True)
+
+    def link(self, target: Path, source: Path, records: dict, key: str, adopted: bool = False):
+        self.safe_parent(target)
+        desired = os.path.relpath(source, target.parent)
+        if target.is_symlink():
+            if target.resolve() == source.resolve():
+                records[key] = desired
+                return
+            self.issue(f"Conflicting symlink (preserved): {target}")
+            return
+        if exists(target):
+            if source.resolve() == target.resolve():
+                self.issue(f"Canonical resource points back to this provider location; reconcile before linking: {target}")
+                return
+            same = (target.is_file() and source.is_file() and target.read_bytes() == source.read_bytes()) or (
+                target.is_dir() and source.is_dir() and tree_digest(target) == tree_digest(source))
+            if not same and not adopted:
+                self.issue(f"Conflicting content (preserved): {target}")
+                return
+        records[key] = desired
+        self.changed(f"Link: {target} -> {desired}")
+        if self.apply:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            self.backup(target)
+            if target.is_dir():
+                shutil.rmtree(target)
+            elif exists(target):
+                target.unlink()
+            target.symlink_to(desired)
+
+    def instructions(self):
+        agents = self.root / "AGENTS.md"
+        claude = self.root / "CLAUDE.md"
+        local_claude = self.root / ".claude/CLAUDE.md"
+        if self.hook and not agents.exists():
+            self.issue("Shared AGENTS.md is missing; reconcile it explicitly rather than recreating instructions in a hook")
+            return
+        if agents.is_symlink():
+            self.issue(f"Project AGENTS.md is externally linked; reconcile before adoption: {agents}")
+            return
+        source_text = agents.read_text() if agents.exists() else None
+        candidates = []
+        for path, wrapper in ((claude, "@AGENTS.md"), (local_claude, "@../AGENTS.md")):
+            if exists(path):
+                if not path.is_file():
+                    self.issue(f"Instruction file is unreadable: {path}")
+                    continue
+                text = path.read_text()
+                if text.strip() == wrapper or (path.is_symlink() and path.resolve() == agents.resolve()):
+                    continue
+                candidates.append((path, text, wrapper))
+        if source_text is None and candidates:
+            source_text = candidates[0][1]
+        if source_text is None:
+            source_text = "# Project instructions\n\nAdd project conventions and build/test commands here.\n"
+        compatible = []
+        for path, text, wrapper in candidates:
+            if strip_guidance(text) != strip_guidance(source_text):
+                self.issue(f"Instructions differ from AGENTS.md (preserved): {path}")
+            else:
+                compatible.append((path, wrapper))
+        self.write(agents, add_guidance(source_text))
+        if not exists(claude) or claude.read_text().strip() == "@AGENTS.md":
+            self.write(claude, "@AGENTS.md\n")
+        for path, wrapper in compatible:
+            self.write(path, wrapper + "\n")
+        self.manifest["instructions"] = {"agents": "AGENTS.md", "claude": "CLAUDE.md"}
+        if exists(self.root / "AGENTS.override.md"):
+            self.issue("AGENTS.override.md masks shared root instructions in Codex; reconcile it explicitly")
+
+    def skills(self, canonical: Path, targets: list[Path], records: dict, base: Path):
+        self.mkdir(canonical)
+        for target_dir in targets:
+            self.mkdir(target_dir)
+            if not target_dir.is_dir() or target_dir.is_symlink():
+                continue
+            for item in sorted(target_dir.iterdir()):
+                if item.name.startswith(".") or not (item / "SKILL.md").is_file():
+                    continue
+                source = canonical / item.name
+                if not exists(source):
+                    if item.is_symlink():
+                        self.issue(f"External skill link needs explicit --import-skill adoption: {item}")
+                        continue
+                    try:
+                        portable_skill(item)
+                    except ConfigError as exc:
+                        self.issue(f"Cannot adopt skill {item}: {exc}")
+                        continue
+                    self.changed(f"Adopt skill: {item} -> {source}")
+                    if self.apply:
+                        shutil.copytree(item, source, symlinks=True)
+        if not canonical.is_dir() or canonical.is_symlink():
+            return
+        wanted = {}
+        for source in sorted(canonical.iterdir()):
+            if source.name.startswith("."):
+                continue
+            if not SKILL_NAME.fullmatch(source.name):
+                self.issue(f"Invalid shared skill directory name: {source}")
+                continue
+            if not (source / "SKILL.md").is_file():
+                self.issue(f"Skill folder lacks SKILL.md: {source}")
+                continue
+            for target_dir in targets:
+                if target_dir.is_symlink():
+                    continue
+                target = target_dir / source.name
+                key = str(target.relative_to(base))
+                self.link(target, source, records, key)
+                wanted[key] = records.get(key)
+        # Remove only links that we owned and that still point to the recorded source.
+        prefixes = [str(target.relative_to(base)) + "/" for target in targets]
+        for key, previous in list(records.items()):
+            if key in wanted or not any(key.startswith(prefix) for prefix in prefixes):
+                continue
+            target = base / key
+            if target.is_symlink() and os.readlink(target) == previous:
+                self.changed(f"Remove obsolete skill link: {target}")
+                if self.apply:
+                    target.unlink()
+                    del records[key]
+            elif exists(target):
+                self.issue(f"Modified obsolete skill link (preserved): {target}")
+            elif self.apply:
+                del records[key]
+
+    def context(self):
+        canonical = self.root / ".agents/context"
+        self.mkdir(canonical)
+        for relative in (".claude/context", ".codex/context"):
+            source = self.root / relative
+            if not exists(source):
+                if relative in self.manifest["links"]:
+                    self.link(source, canonical, self.manifest["links"], relative)
+                continue
+            if source.is_symlink():
+                if source.resolve() == canonical.resolve():
+                    self.manifest["links"][relative] = os.path.relpath(canonical, source.parent)
+                else:
+                    self.issue(f"External context link needs explicit reconciliation: {source}")
+                continue
+            if not source.is_dir():
+                self.issue(f"Context location is not a directory: {source}")
+                continue
+            conflict = False
+            for item in sorted(source.rglob("*")):
+                target = canonical / item.relative_to(source)
+                if item.is_symlink():
+                    self.issue(f"Context dependency link needs reconciliation: {item}")
+                    conflict = True
+                elif item.is_dir():
+                    self.mkdir(target)
+                elif target.exists() and (not target.is_file() or target.read_bytes() != item.read_bytes()):
+                    self.issue(f"Context content differs (preserved): {item}")
+                    conflict = True
+                elif not target.exists():
+                    self.changed(f"Adopt context: {item} -> {target}")
+                    if self.apply:
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(item, target)
+            if not conflict:
+                self.link(source, canonical, self.manifest["links"], relative, adopted=True)
+
+    def mcp_documents(self, personal: bool):
+        codex = (self.home if personal else self.root) / ".codex/config.toml"
+        claude = self.home / ".claude.json" if personal else self.root / ".mcp.json"
+        codex_doc = read_toml(codex)
+        features = plain(codex_doc.get("features", {}))
+        if isinstance(features, dict) and features.get("hooks", features.get("codex_hooks")) is False:
+            self.issue(f"Codex hooks are disabled by configuration (preserved): {codex}")
+        return {"codex": (codex, codex_doc, "mcp_servers"),
+                "claude": (claude, read_json(claude, {}), "mcpServers")}
+
+    def mcp(self, canonical: Path, records: dict, personal: bool = False, imported: Path | None = None):
+        docs = self.mcp_documents(personal)
+        neutral = read_json(canonical, None)
+        if neutral is None:
+            servers = {}
+            for provider, (path, doc, key) in docs.items():
+                native_servers = doc.get(key, {})
+                if not isinstance(plain(native_servers), dict):
+                    raise ConfigError(f"Expected MCP server map: {path}")
+                for name, native in native_servers.items():
+                    try:
+                        candidate = import_server(native, provider)
+                    except ConfigError as exc:
+                        self.issue(f"Cannot adopt MCP {name} from {path}: {exc}")
+                        continue
+                    if name in servers and servers[name] != candidate:
+                        self.issue(f"Provider MCP definitions differ (preserved): {name}")
+                        continue
+                    servers[name] = candidate
+            neutral = {"schema": SCHEMA, "servers": servers}
+            if servers:
+                self.write(canonical, json_text(neutral))
+        if set(neutral) != {"schema", "servers"} or neutral["schema"] != SCHEMA or not isinstance(neutral["servers"], dict):
+            raise ConfigError("Shared MCP manifest requires schema: 1 and a servers object")
+        if imported:
+            imported_doc = read_json(imported, None)
+            imported_servers = imported_doc.get("mcpServers") if imported_doc is not None else None
+            if not isinstance(imported_servers, dict):
+                raise ConfigError("Imported MCP file must contain mcpServers")
+            for name, native in imported_servers.items():
+                candidate = import_server(native, "claude")
+                if name in neutral["servers"] and neutral["servers"][name] != candidate:
+                    self.issue(f"Imported MCP conflicts with canonical definition: {name}")
+                else:
+                    neutral["servers"][name] = candidate
+            self.write(canonical, json_text(neutral))
+        for provider, (path, doc, key) in docs.items():
+            current = doc.get(key, {})
+            if not isinstance(plain(current), dict):
+                raise ConfigError(f"Expected MCP server map: {path}")
+            previous = records.setdefault(provider, {})
+            if not isinstance(previous, dict):
+                raise ConfigError("Invalid managed MCP state")
+            wanted = {}
+            for name, server in neutral["servers"].items():
+                if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", name):
+                    raise ConfigError("Shared MCP names must use letters, digits, underscores, or hyphens")
+                try:
+                    wanted[name] = render_server(server, provider)
+                except ConfigError as exc:
+                    self.issue(f"Cannot render MCP {name} for {provider}: {exc}")
+            changed = False
+            for name, desired in wanted.items():
+                actual = plain(current.get(name))
+                # Claude's omitted stdio type is semantically equivalent.
+                normalized = copy.deepcopy(actual)
+                if provider == "claude" and isinstance(normalized, dict) and "command" in normalized:
+                    normalized.setdefault("type", "stdio")
+                if normalized == desired:
+                    previous[name] = actual
+                    continue
+                if actual is not None and actual != previous.get(name):
+                    self.issue(f"Manual MCP edit/conflict (preserved): {path} [{name}]")
+                    continue
+                self.changed(f"Render MCP: {path} [{name}]")
+                changed = True
+                if self.apply:
+                    if key not in doc:
+                        doc[key] = toml_module().table() if provider == "codex" else {}
+                    if provider == "codex" and name in doc[key]:
+                        update_toml_table(doc[key][name], desired)
+                    else:
+                        doc[key][name] = desired
+                    current = doc[key]
+                    previous[name] = desired
+            for name, last in list(previous.items()):
+                if name in neutral["servers"]:
+                    continue
+                actual = plain(current.get(name))
+                if actual is None:
+                    if self.apply:
+                        del previous[name]
+                elif actual == last:
+                    self.changed(f"Remove obsolete MCP: {path} [{name}]")
+                    changed = True
+                    if self.apply:
+                        del doc[key][name]
+                        del previous[name]
+                else:
+                    self.issue(f"Modified obsolete MCP (preserved): {path} [{name}]")
+            if changed and self.apply:
+                self.write(path, toml_module().dumps(doc) if provider == "codex" else json_text(doc))
+                self.notes.append(f"MCP changed for {provider}; reconnect servers or restart that client if necessary.")
+
+    def import_skill(self, source: Path):
+        source = source.expanduser().resolve()
+        portable_skill(source)
+        target = self.root / ".agents/skills" / source.name
+        if exists(target):
+            if tree_digest(target) != tree_digest(source):
+                self.issue(f"Imported skill conflicts (preserved): {target}")
+            return
+        self.changed(f"Import skill: {source} -> {target}")
+        if self.apply:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(source, target)
+
+    def install_hooks(self):
+        script = self.personal / "skills/agent-sync-config/scripts/agent_sync_config.py"
+        for provider, path in (("codex", self.home / ".codex/hooks.json"),
+                               ("claude", self.home / ".claude/settings.json")):
+            doc = read_json(path, {})
+            if doc.get("disableAllHooks"):
+                self.issue(f"Hooks disabled by existing settings (preserved): {path}")
+            hooks = doc.setdefault("hooks", {})
+            if not isinstance(hooks, dict):
+                raise ConfigError(f"Expected hooks object: {path}")
+            command = shlex.join([sys.executable, str(script), "hook", "--provider", provider,
+                                  "--home", str(self.home)])
+            old_commands = self.registry.setdefault("hook_commands", {}).get(provider, [])
+            for event in ("SessionStart", "UserPromptSubmit"):
+                entries = hooks.setdefault(event, [])
+                if not isinstance(entries, list):
+                    raise ConfigError(f"Expected hook list: {path} [{event}]")
+                found = False
+                updated = []
+                for entry in entries:
+                    if not isinstance(entry, dict) or not isinstance(entry.get("hooks"), list):
+                        raise ConfigError(f"Invalid hook group: {path} [{event}]")
+                    remaining = []
+                    for handler in entry["hooks"]:
+                        if not isinstance(handler, dict):
+                            raise ConfigError(f"Invalid hook handler: {path}")
+                        if handler.get("command") in old_commands or handler.get("command") == command:
+                            if handler.get("command") == command and not found and handler.get("type") == "command" and not handler.get("async"):
+                                remaining.append(handler)
+                                found = True
+                        else:
+                            remaining.append(handler)
+                    if remaining:
+                        updated.append({**entry, "hooks": remaining})
+                if not found:
+                    updated.append({"hooks": [{"type": "command", "command": command, "timeout": 5}]})
+                hooks[event] = updated
+            self.write(path, json_text(doc), 0o600)
+            self.registry["hook_commands"][provider] = [command]
+        self.notes.append("Review/trust Codex hook definitions in /hooks. Restart Claude Code after initial hook installation. External policy can disable hooks; file presence does not prove execution.")
+
+    def personal_setup(self):
+        personal_manifest_path = self.personal / ".agent-sync.json"
+        state = read_json(personal_manifest_path, {"schema": SCHEMA, "links": {}, "mcp": {}})
+        if state.get("schema") != SCHEMA or not isinstance(state.get("links"), dict) or not isinstance(state.get("mcp"), dict):
+            raise ConfigError("Unsupported personal manifest")
+        validate_links(state["links"], personal=True)
+        if self.personal.is_relative_to(self.root):
+            raise ConfigError("Personal defaults must live outside the project repository")
+        self.mkdir(self.personal)
+        agents = self.personal / "AGENTS.md"
+        candidates = [path for path in (self.home / ".codex/AGENTS.md", self.home / ".claude/CLAUDE.md")
+                      if path.is_file() and path.resolve() != agents.resolve()]
+        text = agents.read_text() if agents.exists() else candidates[0].read_text() if candidates else "# Personal agent instructions\n"
+        self.write(agents, text)
+        for path in (self.home / ".codex/AGENTS.md", self.home / ".claude/CLAUDE.md"):
+            self.link(path, agents, state["links"], str(path.relative_to(self.home)))
+        if exists(self.home / ".codex/AGENTS.override.md"):
+            self.issue("Global AGENTS.override.md masks shared personal instructions in Codex")
+        canonical = self.personal / "skills"
+        self.mkdir(canonical)
+        target = canonical / NAME
+        source_hash = tree_digest(SKILL)
+        if not exists(target):
+            self.changed(f"Install setup skill: {target}")
+            if self.apply:
+                shutil.copytree(SKILL, target, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+                state["tool_digest"] = source_hash
+        elif target.resolve() != SKILL.resolve():
+            if target.is_symlink():
+                self.issue(f"Setup skill is linked elsewhere; preserve it and install from that source: {target}")
+            else:
+                installed_hash = tree_digest(target)
+                if installed_hash != source_hash:
+                    if installed_hash != state.get("tool_digest"):
+                        self.issue(f"Setup skill has local edits (preserved): {target}")
+                    else:
+                        self.changed(f"Upgrade setup skill: {target}")
+                        if self.apply:
+                            self.backup(target)
+                            shutil.rmtree(target)
+                            shutil.copytree(SKILL, target, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+                            state["tool_digest"] = source_hash
+                else:
+                    state["tool_digest"] = source_hash
+        targets = [self.home / ".agents/skills", self.home / ".claude/skills"]
+        # Adopt legacy Codex skills without touching its .system directory.
+        legacy = self.home / ".codex/skills"
+        if legacy.is_dir():
+            targets.append(legacy)
+        self.skills(canonical, targets, state["links"], self.home)
+        self.mcp(self.personal / "mcp.json", state["mcp"], personal=True)
+        if self.apply:
+            self.registry["personal_root"] = str(self.personal)
+        self.install_hooks()
+        wrapper = "#!/bin/sh\nexec " + shlex.join([sys.executable, str(target / "scripts/agent_sync_config.py")]) + ' "$@"\n'
+        self.write(self.home / ".local/bin/agent-sync-config", wrapper, 0o755)
+        self.write(personal_manifest_path, json_text(state))
+
+    def repair_personal(self):
+        """Hooks repair links/render shared MCP; installation and adoption stay explicit."""
+        path = self.personal / ".agent-sync.json"
+        state = read_json(path, None)
+        if state is None or state.get("schema") != SCHEMA:
+            self.issue("Personal management state is missing; rerun setup explicitly")
+            return
+        validate_links(state["links"], personal=True)
+        for key, relative in list(state["links"].items()):
+            target = self.home / key
+            source = self.personal / "AGENTS.md" if key in {".codex/AGENTS.md", ".claude/CLAUDE.md"} else self.personal / "skills" / target.name
+            if not exists(target) and source.exists():
+                self.link(target, source, state["links"], key)
+            elif "/skills/" in key and not source.exists():
+                if target.is_symlink() and os.readlink(target) == relative:
+                    self.safe_parent(target)
+                    self.changed(f"Remove obsolete personal skill link: {target}")
+                    if self.apply:
+                        target.unlink()
+                        del state["links"][key]
+                elif exists(target):
+                    self.issue(f"Modified obsolete personal skill link (preserved): {target}")
+        canonical = self.personal / "skills"
+        targets = [self.home / ".agents/skills", self.home / ".claude/skills"]
+        if (self.home / ".codex/skills").is_dir():
+            targets.append(self.home / ".codex/skills")
+        if canonical.is_dir():
+            for source in canonical.iterdir():
+                if not SKILL_NAME.fullmatch(source.name) or not (source / "SKILL.md").is_file():
+                    continue
+                for directory in targets:
+                    target = directory / source.name
+                    if not exists(target):
+                        self.link(target, source, state["links"], str(target.relative_to(self.home)))
+        self.mcp(self.personal / "mcp.json", state["mcp"], personal=True)
+        self.write(path, json_text(state))
+
+    def run(self, imported_skill: Path | None = None, imported_mcp: Path | None = None):
+        if self.home == Path.home().resolve():
+            if os.environ.get("CODEX_HOME") and Path(os.environ["CODEX_HOME"]).expanduser().resolve() != self.home / ".codex":
+                self.issue("Nondefault CODEX_HOME is not supported by this adapter; use default native paths before claiming integration")
+            if os.environ.get("CLAUDE_CONFIG_DIR"):
+                self.issue("CLAUDE_CONFIG_DIR override is not supported by this adapter; use default native paths before claiming integration")
+        if not self.project_only:
+            self.personal_setup()
+        self.mkdir(self.root / ".agents")
+        self.context()
+        self.instructions()
+        if imported_skill:
+            self.import_skill(imported_skill)
+        targets = [self.root / ".claude/skills"]
+        if (self.root / ".codex/skills").is_dir():
+            targets.append(self.root / ".codex/skills")
+        self.skills(self.root / ".agents/skills", targets, self.manifest["links"], self.root)
+        for settings in (self.root / ".claude/settings.json", self.root / ".claude/settings.local.json"):
+            if read_json(settings, {}).get("disableAllHooks"):
+                self.issue(f"Claude hooks are disabled by project settings (preserved): {settings}")
+        self.mcp(self.root / ".agents/mcp.json", self.manifest["mcp"], imported=imported_mcp)
+        self.write(self.root / ".agents/agent-sync.json", json_text(self.manifest))
+        if self.apply and not self.hook:
+            self.registry["projects"][str(self.root)] = {"project_only": self.project_only}
+            self.write(self.registry_path, json_text(self.registry), 0o600)
+        if not self.project_only:
+            for provider, path in (("Codex", self.home / ".agents/skills" / NAME / "SKILL.md"),
+                                   ("Claude", self.home / ".claude/skills" / NAME / "SKILL.md")):
+                if not path.is_file():
+                    self.issue(f"Setup skill is not discoverable by {provider}: {path}")
+        else:
+            self.notes.append("Project-only mode: machine skill installation and automatic hooks were not configured.")
+        return self
+
+
+def stamp(path: Path):
+    try:
+        value = path.lstat()
+        result = [value.st_dev, value.st_ino, value.st_mode, value.st_size, value.st_mtime_ns, value.st_ctime_ns]
+        if path.is_symlink():
+            result.append(os.readlink(path))
+            try:
+                target = path.stat()
+                result += [target.st_ino, target.st_size, target.st_mtime_ns, target.st_ctime_ns]
+            except FileNotFoundError:
+                result.append("broken")
+        return result
+    except FileNotFoundError:
+        return None
+
+
+def fingerprint(sync: Sync):
+    paths = [sync.root / name for name in (".git", "AGENTS.md", "AGENTS.override.md", "CLAUDE.md",
+             ".claude/CLAUDE.md", ".agents/agent-sync.json", ".agents/mcp.json", ".mcp.json", ".codex/config.toml",
+             ".agents/context", ".claude/context", ".codex/context", ".claude/settings.json", ".claude/settings.local.json")]
+    skill_dirs = [sync.root / name for name in (".agents/skills", ".claude/skills", ".codex/skills")]
+    if not sync.project_only:
+        paths += [sync.registry_path, sync.personal / ".agent-sync.json", sync.personal / "AGENTS.md", sync.personal / "mcp.json"]
+        paths += [sync.home / name for name in (".codex/AGENTS.md", ".codex/AGENTS.override.md", ".claude/CLAUDE.md",
+                  ".codex/config.toml", ".claude.json", ".codex/hooks.json", ".claude/settings.json", ".local/bin/agent-sync-config")]
+        skill_dirs += [sync.personal / "skills", sync.home / ".agents/skills", sync.home / ".claude/skills", sync.home / ".codex/skills"]
+    result = {str(path): stamp(path) for path in paths}
+    for directory in skill_dirs:
+        result[str(directory)] = stamp(directory)
+        if directory.is_dir():
+            for child in sorted(directory.iterdir()):
+                if child.name.startswith("."):
+                    continue
+                result[str(child)] = stamp(child)
+                result[str(child / "SKILL.md")] = stamp(child / "SKILL.md")
+    return digest(json_text(result).encode())
+
+
+@contextmanager
+def lock(home: Path):
+    directory = home / ".local/state/agent-sync-config"
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with (directory / "sync.lock").open("a") as stream:
+        try:
+            fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise ConfigError("Another synchronization is in progress; retry shortly") from exc
+        try:
+            yield
+        finally:
+            fcntl.flock(stream, fcntl.LOCK_UN)
+
+
+def hook(args):
+    event = "UserPromptSubmit"
+    try:
+        payload = json.load(sys.stdin)
+        if not isinstance(payload, dict):
+            raise ConfigError("Hook input must be an object")
+        root = root_for(Path(payload.get("cwd", os.getcwd())))
+        home = Path(args.home).expanduser().resolve()
+        registry = read_json(home / ".local/state/agent-sync-config/registry.json", {"projects": {}})
+        registration = registry.get("projects", {}).get(str(root))
+        if registration is None:
+            return 0
+        # Unknown permission modes fail closed for mutation, but still audit.
+        writable = payload.get("permission_mode") in {"default", "acceptEdits", "auto", "dontAsk", "bypassPermissions"}
+        # Current Codex payloads omit sandbox policy, and exec can report
+        # bypassPermissions even with --sandbox read-only. Never infer write access.
+        if args.provider == "codex":
+            writable = writable and payload.get("sandbox_mode") in {"workspace-write", "danger-full-access"}
+        writable = writable and payload.get("sandbox_mode") != "read-only" and os.environ.get("AGENT_SYNC_READ_ONLY") != "1"
+        sync = Sync(home, root, False, project_only=registration["project_only"], hook=True)
+        cache_path = sync.state_dir / "cache" / (digest(str(root).encode())[:24] + ".json")
+        cache = read_json(cache_path, {})
+        current = fingerprint(sync)
+        instruction_stamp = [stamp(root / "AGENTS.md"), stamp(sync.personal / "AGENTS.md") if not sync.project_only else None]
+        event = payload.get("hook_event_name", "UserPromptSubmit")
+        session = args.provider + ":" + str(payload.get("session_id", "unknown"))
+        previous_instructions = cache.get("sessions", {}).get(session)
+        refresh = event == "SessionStart" or previous_instructions != instruction_stamp
+        if cache.get("healthy") and cache.get("fingerprint") == current:
+            pass
+        else:
+            with lock(home):
+                sync.run()
+                if sync.changes and writable:
+                    # Prompt hooks repair project resources, never install/upgrade machine files.
+                    repair = Sync(home, root, True, project_only=True, hook=True)
+                    repair.run()
+                    if not registration["project_only"]:
+                        repair.repair_personal()
+                    sync = Sync(home, root, False, project_only=registration["project_only"], hook=True).run()
+        messages = sync.issues + ["Synchronization required: " + change for change in sync.changes]
+        if refresh:
+            messages.append("Read AGENTS.md and shared personal instructions before continuing; their content may have changed. Curated .agents/context/ files are read when relevant.")
+        if messages:
+            print(json.dumps({"hookSpecificOutput": {"hookEventName": event,
+                  "additionalContext": "agent-sync-config: " + "\n".join(messages) + "\nUse the agent-sync-config skill to reconcile reported conflicts before unrelated work."}}))
+        if os.environ.get("AGENT_SYNC_READ_ONLY") != "1":
+            cache["healthy"] = not sync.issues and not sync.changes
+            cache["fingerprint"] = fingerprint(sync)
+            sessions = cache.setdefault("sessions", {})
+            sessions[session] = instruction_stamp
+            cache["sessions"] = dict(list(sessions.items())[-64:])
+            sync.apply = True
+            # Hooks may cache metadata outside the repo even when managed files
+            # are read-only. CLI check does not write this cache or acquire a lock.
+            sync.write(cache_path, json_text(cache), 0o600)
+        return 0
+    except (ConfigError, OSError, ValueError, KeyError, TypeError) as exc:
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": event,
+              "additionalContext": f"agent-sync-config could not verify configuration ({type(exc).__name__}). Run agent-sync-config check and resolve it before unrelated work."}}))
+        return 0
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("action", nargs="?", choices=("sync", "check", "hook"), default="sync")
+    parser.add_argument("--version", action="version", version=VERSION)
+    parser.add_argument("--project", type=Path, default=Path.cwd())
+    parser.add_argument("--home", type=Path, default=Path.home(), help="Home override for isolated tests")
+    parser.add_argument("--personal-root", type=Path)
+    parser.add_argument("--project-only", action="store_true", help="Skip personal configuration and machine integration")
+    parser.add_argument("--read-only", action="store_true", help="Same behavior as check")
+    parser.add_argument("--json", action="store_true", help="Emit a machine-readable report")
+    parser.add_argument("--provider", choices=("codex", "claude"), default="codex")
+    parser.add_argument("--import-skill", type=Path, help="Explicitly adopt a self-contained skill directory")
+    parser.add_argument("--import-mcp", type=Path, help="Explicitly adopt a Claude-format mcpServers JSON file")
+    args = parser.parse_args(argv)
+    if args.action == "hook":
+        return hook(args)
+    apply = args.action != "check" and not args.read_only
+    try:
+        home, root = args.home.expanduser().resolve(), root_for(args.project)
+        def run():
+            return Sync(home, root, apply, args.personal_root, args.project_only).run(args.import_skill, args.import_mcp)
+        if apply:
+            with lock(home):
+                result = run()
+        else:
+            result = run()
+        report = {"version": VERSION, "project": str(root), "read_only": not apply,
+                  "changes": result.changes, "issues": result.issues, "notes": result.notes}
+        if args.json:
+            print(json_text(report), end="")
+        else:
+            for kind, entries in (("CONFLICT", result.issues), ("CHANGE" if apply else "DRIFT", result.changes), ("NOTE", result.notes)):
+                for message in entries:
+                    print(f"{kind}: {message}")
+            if not result.issues and not result.changes:
+                print("Configuration is synchronized.")
+        return 1 if result.issues or (not apply and result.changes) else 0
+    except (ConfigError, OSError, ValueError, TypeError, KeyError) as exc:
+        # Never print configuration contents or resolved environment values on error.
+        message = str(exc) if isinstance(exc, ConfigError) else type(exc).__name__
+        if args.json:
+            print(json_text({"error": message}), end="")
+        else:
+            print(f"ERROR: {message}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    if sys.version_info < (3, 11):
+        sys.exit("agent-sync-config requires Python 3.11 or later")
+    sys.exit(main())
