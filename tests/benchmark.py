@@ -22,7 +22,7 @@ def main():
             (folder / "SKILL.md").write_text(f"---\nname: sample-{index}\ndescription: A fixture skill.\n---\nFixture.\n")
         subprocess.run([sys.executable, str(SCRIPT), "--home", str(home), "--project", str(repo)],
                        check=True, stdout=subprocess.DEVNULL)
-        # Global checks use the same metadata fast path and must remain cheap.
+        # Global checks also inspect current files directly without stored metadata.
         for index in range(30):
             folder = home / ".agents/skills" / f"sample-{index}"
             folder.mkdir(parents=True)

@@ -3,6 +3,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+from test_sync import snapshot
 import subprocess
 import sys
 import tempfile
@@ -46,48 +47,44 @@ def main():
         assert not tool("check")["issues"]
         results["no_op_removal"] = "passed"
 
-        command([*cli, "remove", "review-code", "--global", "--agent", "claude-code", "--yes"])
-        report = tool(expected=1)
-        assert "review-code" in report["pending_removals"]
-        assert not (home / ".claude/skills/review-code").exists()
-        assert (home / "agent-config/skills/review-code/SKILL.md").is_file()
-        # Explicit adoption restores a skill after the decision is made in chat.
-        tool("--import-skill", str(home / "agent-config/skills/review-code"))
-        tool("check")
-        results["partial_provider_removal"] = "passed"
+        installed = home / ".agents/skills/agent-sync-config/scripts/agent_sync_config.py"
+        installed_before = snapshot(installed.parent.parent)
+        project_before = snapshot(project)
+        tool(script=installed)
+        assert snapshot(installed.parent.parent) == installed_before
+        assert snapshot(project) == project_before
+        results["installed_runtime_preservation"] = "passed"
 
-        command([*cli, "remove", "review-code", "--global", "--yes"])
-        report = tool(expected=1)
-        assert "review-code" in report["pending_removals"]
+        command([*cli, "remove", "review-code", "--global", "--agent", "claude-code", "--yes"])
+        before = snapshot(base)
+        report = tool("check", expected=1, script=installed)
+        assert report["changes"] and not report["issues"]
+        assert snapshot(base) == before
+        tool(script=installed)
+        assert (home / ".claude/skills/review-code").is_symlink()
+        results["partial_provider_removal_and_explicit_repair"] = "passed"
+
+        command([*cli, "remove", "review-code", "--global", "--agent", "codex", "claude-code", "--yes"])
+        tool(script=installed)
         assert not (home / ".agents/skills/review-code").exists()
-        tool("remove-skill", "review-code", "--yes")
-        tool()
-        assert not (home / "agent-config/skills/review-code").exists()
-        results["complete_removal_and_persistence"] = "passed"
+        assert not (home / ".claude/skills/review-code").exists()
+        results["complete_removal_no_restoration_source"] = "passed"
 
         command([*cli, "add", str(source), "--global", "--agent", "codex", "claude-code", "--yes"])
-        report = tool(expected=1)
-        assert report["pending_removals"]["review-code"]["kind"] == "reinstall"
-        tool("--import-skill", str(home / ".agents/skills/review-code"))
-        tool("check")
-        results["reinstallation_acceptance"] = "passed"
+        tool(script=installed)
+        tool("check", script=installed)
+        results["explicit_reinstallation"] = "passed"
 
-        command([*cli, "remove", "agent-sync-config", "--global", "--yes"])
-        report = tool(expected=1)
-        assert "agent-sync-config" in report["pending_removals"]
-        installed = home / "agent-config/skills/agent-sync-config/scripts/agent_sync_config.py"
-        tool("uninstall", "--yes", "--purge-shared-sources", script=installed)
+        command([*cli, "remove", "agent-sync-config", "--global", "--agent", "codex", "claude-code", "--yes"])
+        report = tool()
+        assert "pending_removals" not in report
         assert not installed.exists()
         assert not (home / "agent-config").exists()
         assert not (home / ".local/bin/agent-sync-config").exists()
+        assert not (home / ".local/state/agent-sync-config").exists()
         assert (home / ".agents/skills/review-code/SKILL.md").is_file()
         assert (home / ".claude/skills/review-code/SKILL.md").is_file()
-        assert not (home / ".codex/AGENTS.md").is_symlink()
-        assert not (home / ".claude/CLAUDE.md").is_symlink()
-        for relative in (".codex/hooks.json", ".claude/settings.json"):
-            doc = json.loads((home / relative).read_text()) if (home / relative).exists() else {}
-            assert not any(doc.get("hooks", {}).values())
-        results["setup_skill_removal_and_installed_self_uninstall"] = "passed"
+        results["synchronizer_removal_without_recreation"] = "passed"
     print(json.dumps(results, indent=2))
 
 

@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+from test_sync import snapshot
 import selectors
 import shutil
 import subprocess
@@ -59,7 +60,7 @@ def codex_discovery(binary, env, repo, global_installed=True):
         raise AssertionError(f"Codex did not respond to {method}")
 
     try:
-        request(1, "initialize", {"clientInfo": {"name": "agent-sync-smoke", "version": "0.4.0"},
+        request(1, "initialize", {"clientInfo": {"name": "agent-sync-smoke", "version": "0.5.0"},
                                   "capabilities": {"experimentalApi": True}})
         send({"method": "initialized", "params": {}})
         skills = request(2, "skills/list", {"cwds": [str(repo)], "forceReload": True})
@@ -107,11 +108,10 @@ def main():
         run(["git", "init", "-q", str(repo)], env, repo)
         folder = repo / ".agents/skills/review-code"; folder.mkdir(parents=True)
         (folder / "SKILL.md").write_text("---\nname: review-code\ndescription: Review a fixture change.\n---\nReview the code.\n")
-        (repo / ".agents/mcp.json").write_text(json.dumps({"schema": 1, "servers": {
-            "local-probe": {"transport": "stdio", "command": sys.executable, "args": ["-V"]}}}))
-        (home / "agent-config").mkdir()
-        (home / "agent-config/mcp.json").write_text(json.dumps({"schema": 1, "servers": {
-            "global-probe": {"transport": "stdio", "command": sys.executable, "args": ["-V"]}}}))
+        (repo / ".mcp.json").write_text(json.dumps({"mcpServers": {
+            "local-probe": {"type": "stdio", "command": sys.executable, "args": ["-V"]}}}))
+        (home / ".claude.json").write_text(json.dumps({"mcpServers": {
+            "global-probe": {"type": "stdio", "command": sys.executable, "args": ["-V"]}}}))
         if args.skills_cli:
             assert args.node, "--node is required for the skills CLI smoke test"
             run([args.node, str(args.skills_cli.resolve()), "add", str(ROOT), "--global", "--agent", "codex", "claude-code",
@@ -128,7 +128,11 @@ def main():
         global_skill = home / ".agents/skills/global-review"
         global_skill.mkdir(parents=True, exist_ok=True)
         (global_skill / "SKILL.md").write_text("---\nname: global-review\ndescription: Review a global fixture.\n---\nReview changes.\n")
+        installed_before = snapshot(home / ".agents/skills/agent-sync-config")
         run([sys.executable, str(SCRIPT), "--scope", "global", "--home", str(home)], env, repo)
+        assert snapshot(home / ".agents/skills/agent-sync-config") == installed_before
+        assert not (home / "agent-config").exists()
+        assert not (home / ".local/state/agent-sync-config").exists()
         run([sys.executable, str(SCRIPT), "--scope", "project", "--home", str(home), "--project", str(repo)], env, repo)
         # Trust only this disposable test project's config layer for native MCP discovery.
         assert not (repo / ".agents/skills/agent-sync-config").exists()
@@ -139,7 +143,7 @@ def main():
                           "\n[projects." + json.dumps(str(repo)) + ']\ntrust_level = "trusted"\n')
         if args.codex:
             report["codex_version"] = run([args.codex, "--version"], env, repo).strip()
-            report["codex"] = codex_discovery(args.codex, env, repo)
+            report["codex"] = codex_discovery(args.codex, env, repo, global_installed=bool(args.skills_cli))
         else:
             report["codex"] = "not installed"
         if args.claude:
@@ -152,20 +156,17 @@ def main():
                                 "model_turn": "not requested"}
         else:
             report["claude"] = "not installed"
-        run([sys.executable, str(SCRIPT), "uninstall", "--scope", "global", "--home", str(home),
-             "--yes", "--purge-shared-sources"], env, repo)
-        assert not (home / "agent-config").exists()
-        assert not (home / ".agents/skills/agent-sync-config").exists()
-        assert (home / ".agents/skills/global-review/SKILL.md").is_file()
-        assert not (home / ".agents/skills/global-review").is_symlink()
+        if args.skills_cli:
+            run([args.node, str(args.skills_cli.resolve()), "remove", "agent-sync-config", "--global", "--agent", "codex", "claude-code", "--yes"], env, repo)
+            assert not (home / ".agents/skills/agent-sync-config").exists()
+        run([sys.executable, str(SCRIPT), "check", "--scope", "global", "--home", str(home)], env, repo)
         run([sys.executable, str(SCRIPT), "check", "--scope", "project", "--home", str(home), "--project", str(repo)], env, repo)
         if args.codex:
-            report["codex_after_global_uninstall"] = codex_discovery(args.codex, env, repo, global_installed=False)
+            report["codex_after_installer_removal"] = codex_discovery(args.codex, env, repo, global_installed=False)
         if args.claude:
             native = run([args.claude, "mcp", "get", "global-probe"], env, repo)
             assert "global-probe" in native and sys.executable in native, native
-            report["claude_after_global_uninstall"] = {"native_mcp_preserved": "passed"}
-        report["global_uninstall_native_skills_and_project_preservation"] = "passed"
+        report["native_configuration_usable_without_synchronizer"] = "passed"
     print(json.dumps(report, indent=2))
 
 

@@ -1,72 +1,52 @@
-# Shared MCP configuration
+# Native MCP sharing
 
-`.agents/mcp.json` is this project's neutral format, not a provider standard.
-Personal definitions use the same format in the registered personal root's
-`mcp.json`. Run `--scope project` for project definitions and `--scope global`
-for personal definitions. Synchronization and explicit `--import-mcp` adoption
-affect only the selected scope. A minimal manifest contains `schema: 1` and a `servers` object:
+The synchronizer reads native definitions directly. Project files are `.mcp.json`
+for Claude and `.codex/config.toml` for Codex. Global files are top-level
+`mcpServers` in `~/.claude.json` and `mcp_servers` in `~/.codex/config.toml`.
+Claude's private project entries in `~/.claude.json` are not project-scope input.
 
-```json
-{
-  "schema": 1,
-  "servers": {
-    "local-tools": {
-      "transport": "stdio",
-      "command": "python3",
-      "args": ["/absolute/path/to/server.py"],
-      "env": {"LOG_LEVEL": "info"},
-      "env_vars": ["SERVICE_API_KEY"]
-    },
-    "remote-tools": {
-      "transport": "http",
-      "url": "https://example.com/mcp",
-      "bearer_token_env_var": "SERVICE_TOKEN",
-      "env_headers": {"X-Tenant": "SERVICE_TENANT"}
-    }
-  }
-}
+A server present on only one side is a candidate for sharing. Equivalent native
+definitions need no writes. Same-name differences are conflicts, even if only one
+side was edited since your last run: there is no stored baseline or history.
+Resolve them explicitly:
+
+```sh
+./bin/agent-sync-config --scope project --project /path/to/repo --mcp-source claude
+./bin/agent-sync-config --scope global --mcp-source codex
 ```
 
-Server names use letters, digits, hyphens, or underscores. stdio requires a
-nonempty `command`; HTTP requires a nonempty `url`.
+Source selection resolves portable same-name differences. It does not remove
+servers missing from one side; absent definitions can be adopted again. To remove
+a shared server, remove it from both native configurations.
 
-| Shared field | Codex output | Claude output |
+Import native Claude-format definitions with `--import-mcp /path/to/file.json`.
+The file must contain `mcpServers`. An import explicitly selects the definitions
+for its named servers, leaving other servers intact. Do not combine it with
+`--mcp-source`. No neutral MCP manifest is created or stored.
+
+| Portable concept | Codex | Claude |
 | --- | --- | --- |
-| `command`, `args` | Same fields | Same fields, `type: stdio` |
-| `env` | Literal nonsecret environment values | Same values |
-| `env_vars` | Inherited variable names | `env` entries with `${NAME}` |
-| `url` | Same field | Same field, `type: http` |
-| `headers` | `http_headers` | `headers` |
-| `env_headers` | `env_http_headers` | Header values `${NAME}` |
-| `bearer_token_env_var` | Same field | `Authorization: Bearer ${NAME}` |
-| `cwd` | Same field | Unsupported; reported |
+| stdio | `command`, `args` | `type: stdio`, `command`, `args` |
+| HTTP | `url` | `type: http`, `url` |
+| Nonsecret environment | `env` | `env` |
+| Inherited environment | `env_vars` | `env` values `${NAME}` |
+| Nonsecret headers | `http_headers` | `headers` |
+| Environment headers | `env_http_headers` | `headers` values `${NAME}` |
+| Bearer-token environment | `bearer_token_env_var` | `Authorization: Bearer ${NAME}` |
 
-Use `env`/`headers` only for literal nonsecret values. Credential-like keys and
-literal Authorization headers are rejected. `env_vars` passes a variable under
-the same name; aliases and arbitrary interpolation are not portable. Provider
-workspace placeholders in command paths, arguments, cwd, or URLs are rejected.
-Use literal paths and independently define environment variables in the launch
-environment. GUI clients may not inherit your terminal's environment.
+An omitted Claude stdio `type` is equivalent to `stdio`. Inherited environment
+variables must keep the same name; aliased interpolation is not portable. Literal
+credential environment values and headers are rejected for sharing. Use inherited
+variables and configure them independently in each client's launch environment.
 
-The supported HTTP transport is streamable HTTP; SSE-only definitions are not
-translated. Provider-specific timeout, tool filtering, and authentication options
-cannot be adopted into the shared subset automatically. Preserve them in native
-configuration and reconcile deliberately. An extra native option on a managed
-definition is treated as a manual edit and preserved, not discarded.
+SSE, provider placeholders, plugin-managed definitions, Codex `cwd`, timeout/tool
+policies, and native authentication options are outside the portable subset.
+Unsupported definitions remain intact and are reported, including when a source
+was selected. A selection never authorizes dropping unsupported destination
+options. Nonconflicting definitions can still be shared.
 
-On first setup, supported existing provider definitions can become canonical.
-Identical definitions are adopted; differing ones are reported. A native server
-without an explicit stdio `type` is treated as equivalent to `type: stdio`.
-
-Subsequent runs compare canonical output, native configuration, and the recorded
-last output. Canonical-only changes render safely; divergent native edits require
-reconciliation. To resolve a conflict, review and update the canonical source and
-the corresponding native definition to agree, then rerun. There is no force flag.
-
-Personal Claude definitions use the top-level `mcpServers` in `~/.claude.json`.
-Private project mappings in that file are preserved. Project output uses
-`.mcp.json`. Codex uses global/trusted project `.codex/config.toml` layers.
-
-OAuth credentials, login sessions, and native server approvals remain independent.
-Reconnect/restart after changes when required. The tool does not resolve `${...}`
-values or execute MCP servers during synchronization.
+Native options, unrelated settings, TOML comments, file permissions, credentials,
+OAuth sessions, and approvals remain provider-managed. The tool neither resolves
+environment variables nor starts servers. Reconnect/restart clients when required;
+project Codex configuration requires native trust. Checks and dry runs are
+strictly read-only.

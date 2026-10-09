@@ -5,9 +5,10 @@ coding clients are not implemented or verified integrations. Changing a model
 within a client generally retains that client's resource loader; changing the
 client requires a separate compatibility check.
 
-Keep `AGENTS.md`, `.agents/skills/`, curated context, and the neutral MCP manifest
-as canonical resources. Add an explicit client adapter when support is requested,
-without introducing another source of truth.
+Keep `AGENTS.md`, `.agents/skills/`, and existing referenced context as shared
+resources. Translate MCP directly between native configurations. Add an explicit
+client adapter when support is requested, without introducing another source of
+truth, configuration root, or state store.
 
 Each adapter must establish:
 
@@ -24,5 +25,5 @@ capability separately.
 
 Sharing files does not guarantee identical plugin behavior or model compliance.
 Adapters should establish shared references without bundling the synchronizer
-into projects or adding automatic hooks. Repairs and MCP rendering use explicit
-checks/syncs. Plugins remain provider-managed.
+into projects or adding automatic hooks. Repairs and native MCP translation use
+explicit checks/syncs. Plugins remain provider-managed.

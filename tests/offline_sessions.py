@@ -92,7 +92,7 @@ def session(command, env, repo):
     sent = MockAPI.requests[start:]
     assert sent, "Native session did not use the local mock API"
     serialized = json.dumps(sent)
-    assert "ad hoc copying" in serialized, "The invoked setup skill body was not loaded"
+    assert "bundled deterministic tool" in serialized, "The invoked setup skill body was not loaded"
     return sent, result.stdout
 
 
@@ -120,12 +120,17 @@ def main():
                 env.pop(key, None)
             subprocess.run(["git", "init", "-q", str(repo)], check=True)
             (repo / "AGENTS.md").write_text("PROJECT_INSTRUCTIONS_SENTINEL\n")
-            (home / "agent-config").mkdir()
-            (home / "agent-config/AGENTS.md").write_text("PERSONAL_INSTRUCTIONS_SENTINEL\n")
+            (home / ".codex").mkdir()
+            (home / ".codex/AGENTS.md").write_text("PERSONAL_INSTRUCTIONS_SENTINEL\n")
+            installed = home / ".agents/skills/agent-sync-config"
+            installed.parent.mkdir(parents=True)
+            shutil.copytree(ROOT / "skills/agent-sync-config", installed, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+            discovery = home / ".claude/skills"; discovery.mkdir(parents=True)
+            (discovery / "agent-sync-config").symlink_to("../../.agents/skills/agent-sync-config")
             skill = repo / ".agents/skills/review-code"; skill.mkdir(parents=True)
             (skill / "SKILL.md").write_text("---\nname: review-code\ndescription: Review a fixture.\n---\nFixture.\n")
-            (repo / ".agents/mcp.json").write_text(json.dumps({"schema": 1, "servers": {
-                "local-probe": {"transport": "stdio", "command": sys.executable,
+            (repo / ".mcp.json").write_text(json.dumps({"mcpServers": {
+                "local-probe": {"type": "stdio", "command": sys.executable,
                                 "args": [str(ROOT / "tests/fixtures/mcp_server.py")]}}}))
             subprocess.run([sys.executable, str(SCRIPT), "--scope", "global", "--home", str(home)],
                            env=env, check=True, stdout=subprocess.DEVNULL)
@@ -139,7 +144,7 @@ def main():
                               f'[projects.{json.dumps(str(repo))}]\ntrust_level="trusted"\n')
             (repo / ".claude/settings.local.json").write_text(json.dumps({"enabledMcpjsonServers": ["local-probe"]}))
             link = repo / ".claude/skills/review-code"
-            cache_dir = home / ".local/state/agent-sync-config/cache"
+            cache_dir = home / ".local/state/agent-sync-config"
             if args.codex:
                 link.unlink()
                 command = [args.codex, "exec", "--sandbox", "read-only", "--json"]

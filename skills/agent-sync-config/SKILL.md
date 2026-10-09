@@ -1,124 +1,94 @@
 ---
 name: agent-sync-config
-description: Set up, check, or synchronize shared instructions, skills, curated project context, and MCP configuration across Codex and Claude Code. Use for a new repository, configuration drift, reference drift, an explicit global configuration request, or removing/uninstalling shared global skills.
+description: Set up or check shared native instructions, skills, context references, and MCP configuration for Codex and Claude Code in a project or explicitly selected global scope.
 ---
 
 # Agent Sync Config
 
-Use the bundled deterministic tool rather than implementing synchronization with
-ad hoc copying or edits to provider configuration. Installing this skill globally
-makes it available in any repository; installation does not select execution scope.
+Use the bundled deterministic tool to inspect current native files and establish
+shared references. Installing this skill globally makes it available in any
+repository; installation never selects execution scope. Keep the tool in its
+installer-owned location. Never copy it into shared configuration or projects.
 
-## Choose the scope
+## Select the scope
 
-Honor an explicit project/global request. Global synchronization always requires
-`--scope global` and must omit `--project`. Never escalate a project operation to
-global scope because resources are missing, malformed, or conflicting.
+Honor an explicit project/global request. Global operations always require
+`--scope global` and omit `--project`. Never escalate a project request because
+resources are missing, malformed, or conflicting.
 
-For an ordinary setup/sync request without a scope, run:
+For an ordinary setup/sync request without an explicit scope, run:
 
 ```sh
 python3 <skill-directory>/scripts/agent_sync_config.py --project <repository> --json
 ```
 
-The tool resolves the Git/worktree or managed-project root. If that root has
-`.agents`, `.claude`, `.codex`, `AGENTS.md`, `AGENTS.override.md`, `CLAUDE.md`, or
-`.mcp.json`, it synchronizes project scope only. An error never selects global.
+Existing local `.agents`, `.claude`, `.codex`, `AGENTS.md`, `AGENTS.override.md`,
+`CLAUDE.md`, or `.mcp.json` selects project scope. Git/worktree discovery resolves
+the root; outside Git, use the explicitly selected/current directory.
 
-For a fresh project, the report returns exit code 2 with `selection_required: true`
-and makes no changes. Ask in chat: “Initialize shared configuration in this
-project, or synchronize your global configuration?” Wait for the user's choice,
-then run the chosen explicit command below. Do not infer approval from silence.
-Cancellation makes no changes. If the user already explicitly requested project
-initialization or global synchronization, use that scope directly.
+A fresh noninteractive request returns exit code 2 and `selection_required: true`
+without writes. Ask whether to initialize this project or synchronize global
+configuration, wait for the choice, then use the explicit scope. Cancellation
+makes no changes. If the request already specifies the scope, invoke it directly:
 
 ```sh
 python3 <skill-directory>/scripts/agent_sync_config.py --scope project --project <repository>
 python3 <skill-directory>/scripts/agent_sync_config.py --scope global
 ```
 
-Project setup creates shared configuration, relative skill links, and a small
-ownership manifest. It never installs this skill, a tool runtime, or automatic
-hooks in the project. Global setup manages personal resources and the terminal
-wrapper without automatic hooks. The tool stays installed on the machine.
-The same scoped command initializes missing resources and reconciles existing setup.
+## Check and share
 
-## Check and reconcile
-
-For check-only requests, planning mode, or read-only environments, run an audit.
-Unscoped checks audit the project without asking or writing; global checks need
-an explicit global scope:
+For checks, planning mode, or read-only environments, audit without writes:
 
 ```sh
 python3 <skill-directory>/scripts/agent_sync_config.py check --scope project --project <repository>
 python3 <skill-directory>/scripts/agent_sync_config.py check --scope global
 ```
 
-Read the report: success is 0, conflicts/read-only drift is 1, and invalid input or
-required scope selection is 2. Reports name the resolved scope; global reports
-have no project target. Preserve conflicting content and propose a concrete
-reconciliation to its canonical resources. Do not force overwrite, stage, or
-commit unrelated changes. Rerun after an authorized reconciliation.
+Unscoped check audits project scope. `--dry-run` previews changes without writes.
+Reports name the scope and paths; global reports have no project target. Exit
+codes are 0 for success, 1 for conflicts/check drift, and 2 for invalid input,
+scope selection, or filesystem failure. Read the report before claiming success.
 
-Project instructions belong in `AGENTS.md`; `CLAUDE.md` imports them. Project
-skills live in `.agents/skills/`, curated context in `.agents/context/`, and MCP
-in `.agents/mcp.json`. Personal instructions, skills, and MCP live in the registered
-personal source (default `~/agent-config/`) and change only through global sync.
-Use `--personal-root` only with global scope. `--project-only` remains a project
-scope alias. Do not copy credentials, conversations, automatic memory, plugin
-caches, or provider-specific capabilities into shared files.
+Project instructions live in AGENTS.md; CLAUDE.md imports them. Global shared
+instructions live in ~/.codex/AGENTS.md, with ~/.claude/CLAUDE.md referencing them.
+Skills live in .agents/skills (or ~/.agents/skills globally); Claude uses relative
+per-skill links. Do not add duplicate .codex/skills entries. Reference existing
+context documents from the shared instructions; create no custom context store.
 
-Instruction and skill edits are shared immediately through imports/links. Invoke
-sync to adopt new resources, repair references, reconcile conflicts, or regenerate
-MCP output. No prompt hook or automatic repair is installed. The global Codex
-skill entrypoint is ~/.agents/skills; do not create duplicate ~/.codex/skills links.
+Instruction and skill edits are shared through references immediately. Explicit
+sync adopts compatible new ordinary skills or repairs references. Preserve
+conflicting files, external dependencies, native overrides, system skills,
+provider-managed skills, plugin settings, and unrelated hooks.
 
-Explicit project sync migrates recorded unchanged legacy project hooks, packaged
-setup runtime, and its owned discovery links. Explicit global sync separately
-retires recorded legacy global hooks and verified owned Codex aliases. Preserve
-modified or unowned artifacts, disabled-hook/trust controls, and system skills.
-Explain reported migration conflicts without bypassing native trust. Read-only
-checks never apply migration. A legacy global hook's message is not evidence that
-a project operation synchronized global files; inspect the resolved scope and
-reported paths before diagnosing a scope violation.
-
-Portable resources from plugins require explicit adoption with `--import-skill`
-or `--import-mcp` into the selected scope; resolve dependencies first. The tool
-does not install, update, or translate plugins. Additional clients require tested
-integrations; initial support is local Codex and Claude Code.
-
-## Remove global skills or uninstall
-
-Global lifecycle commands require explicit `--scope global`. Preview concrete
-paths before cleanup, then honor the user's removal/uninstall request:
+MCP uses native .mcp.json and .codex/config.toml in projects, or ~/.claude.json
+and ~/.codex/config.toml globally. No neutral MCP file or historical baseline is
+stored. Differing definitions require a user-selected source:
 
 ```sh
-python3 <skill-directory>/scripts/agent_sync_config.py remove-skill <name> --scope global --dry-run --json
-python3 <skill-directory>/scripts/agent_sync_config.py remove-skill <name> --scope global --yes --json
-python3 <skill-directory>/scripts/agent_sync_config.py uninstall --scope global --dry-run --json
-python3 <skill-directory>/scripts/agent_sync_config.py uninstall --scope global --yes --json
+python3 <skill-directory>/scripts/agent_sync_config.py --scope project --project <repository> --mcp-source claude
+python3 <skill-directory>/scripts/agent_sync_config.py --scope global --mcp-source codex
 ```
 
-`--yes` confirms the specified cleanup; use it when the user already authorized
-that operation. It does not decide ambiguous external removals. To delete
-redundant owned personal sources after preserving native configuration, add
-`--purge-shared-sources` to uninstall only when requested. Uninstall preserves
-native instructions, remaining skills, MCP settings, unrelated hooks, and projects.
-It removes the owned setup skill, any recorded legacy global handlers, wrapper,
-and registration without recreating legacy Codex aliases.
-Use uninstall rather than remove-skill for agent-sync-config itself.
+Ask which source to use unless the user already selected it. Explicit
+--import-mcp accepts native Claude-format mcpServers; --import-skill adopts a
+self-contained ordinary skill into the selected scope. Do not translate or copy
+credentials, plugin runtime dependencies, provider-specific settings, memory,
+conversations, or caches. The synchronizer cannot import itself.
 
-Direct `npx skills remove --global` cannot delete our retained personal source.
-A later sync/check reports `pending_removals` and suppresses reinstallation.
-For a reported removal, ask whether to complete removal, restore the installation,
-or cancel. Complete ordinary removal with remove-skill; complete setup-skill
-removal with uninstall. For restoration, run interactive terminal sync when
-available, or explicitly import the retained shared skill source after the user
-chooses restoration. A reported reinstall can be accepted through explicit
---import-skill adoption from its new ordinary source. Never infer the answer
-from --yes or a missing file. Checks remain strictly read-only.
+## Installation, removal, and legacy resources
 
-Conflicts block deletion. Preserve them and explain the paths requiring
-reconciliation. An interrupted uninstall keeps recovery metadata; retry with
-the original purge choice from another runtime or checkout. Private backups
-remain available; purge is not secure erasure.
+The tool stores no ownership manifest, registry, history, backups, persistent
+locks, or recovery state. It installs no hooks or terminal launcher. Each run
+inspects current files; missing references do not reveal removal intent.
+Explicit sync can repair a removed provider link. Complete removals have no
+hidden shared source to restore; a remaining ordinary copy can be adopted again.
+
+Use the user's installer for installation, updates, and removal. For Skills CLI,
+remove the tool with `npx skills remove agent-sync-config --global --agent codex
+claude-code`. Removing the tool leaves native shared references usable.
+
+Legacy custom sources, manifests, setup packages, hooks, aliases, and external
+instruction links are preserved and reported. Reconcile native replacements and
+cleanup explicitly; never run retired uninstall/remove-skill/purge commands or
+invent ownership-based deletion. Never stage, commit, or push unless requested.
