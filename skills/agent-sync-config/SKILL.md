@@ -5,8 +5,8 @@ description: Set up or check shared native instructions, skills, context referen
 
 # Agent Sync Config
 
-Use the bundled deterministic tool to inspect current native files and establish
-shared references. Installing this skill globally makes it available in any
+Use the bundled deterministic tool with Python 3.9+ to inspect current native
+files and establish shared references. Installing this skill globally makes it available in any
 repository; installation never selects execution scope. Keep the tool in its
 installer-owned location. Never copy it into shared configuration or projects.
 

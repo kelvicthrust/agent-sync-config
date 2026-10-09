@@ -1,7 +1,7 @@
 # Repository guidance
 
 This repository ships the `agent-sync-config` skill and its Python runtime.
-Use Python 3.11+ on macOS/Linux. The shipped skill is in
+Use Python 3.9+ on macOS/Linux. The shipped skill is in
 `skills/agent-sync-config/`; `bin/agent-sync-config` invokes its runtime.
 
 ## Implementation and verification
@@ -30,16 +30,20 @@ Use Python 3.11+ on macOS/Linux. The shipped skill is in
 
 ## Releases
 
-- Match the runtime VERSION, README version, and `vX.Y.Z` tag. Before 1.0,
+- Match the runtime VERSION and `vX.Y.Z` tag. Before 1.0,
   breaking workflow/default changes advance the minor version; fixes use patches.
-- Finish documentation before tagging. Include pinned installation instructions
-  and migration steps when behavior changes. Use GitHub release notes; do not
-  create a separate release.md.
+- Publish regular releases by default, including versions below 1.0. Do not label
+  commits, tag messages, or releases as previews, or mark a release as a prerelease,
+  unless the user explicitly requests it. Preserve existing releases and tags.
+- Keep the README independent of release versions. Update it only when usage or
+  requirements change; do not edit it just to publish a release. Put versioned
+  installation commands and release-specific migration steps in GitHub release
+  notes. Do not create a separate release.md.
 - Verify the working tree is clean, the final commit is on origin/main, and its
   required CI jobs pass. Create an annotated tag pointing to that exact commit
   and push only the intended tag.
-- Publish a GitHub release from the existing remote tag (`--verify-tag`). Mark
-  preview releases as prereleases. Never silently replace an existing release.
+- Publish a regular GitHub release from the existing remote tag (`--verify-tag`).
+  Never silently replace an existing release.
 - Explain changes, migration, tested behavior, and material limitations in the
   release notes. Verify installation from the tagged source in a disposable home.
 - Skills.sh discovery uses installation telemetry, not a separate package publish.

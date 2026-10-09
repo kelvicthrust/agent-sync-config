@@ -1,6 +1,6 @@
 # Testing and compatibility
 
-Use Python 3.11+ and disposable homes/projects. Do not copy credentials, change
+Use Python 3.9+ and disposable homes/projects. Do not copy credentials, change
 personal configuration, or contact model providers. Focused tests run while editing;
 run the full automated suite once after implementation settles.
 
@@ -96,7 +96,7 @@ settings. Preserve unknown/modified files and private version-control data.
 The tool does not automatically uninstall old integrations or purge sources.
 
 Native loading is verified separately from filesystem reconciliation. Support is
-local macOS/Linux with Python 3.11+; CI uses Python 3.11 and 3.13. Cloud sessions,
+local macOS/Linux with Python 3.9+; CI includes Python 3.9, 3.11, and 3.13. Cloud sessions,
 Windows, Cursor, Grok, and authenticated model compliance are not established by
 these fixtures. Record current versions and measured verification results here
 only after running the checks.
@@ -121,3 +121,16 @@ and Claude Code 2.1.295:
 These are local verification results, not authenticated model-compliance tests
 or results from the Linux/Python CI matrix. Personal configuration and other
 projects were not modified.
+
+## Local 0.5.1 Python compatibility verification
+
+The minimum was lowered to Python 3.9 without changing the bundled dependencies.
+All 45 automated tests passed with the existing Python 3.9.6 interpreter
+(12.605 seconds), including native MCP round trips and filesystem scope isolation.
+Skill metadata validation also passed. Explicit checks with 30 skills and 20
+samples measured project median 135.53 ms / p95 182.66 ms and global median
+129.35 ms / p95 132.45 ms. These timings used a different interpreter from the
+0.5.0 run and are not a controlled performance comparison.
+
+The macOS/Linux CI matrix includes Python 3.9, 3.11, and 3.13. CI results are
+available in GitHub Actions. Python 3.11+ remains recommended for upstream support.

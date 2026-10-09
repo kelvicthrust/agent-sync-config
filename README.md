@@ -7,8 +7,7 @@ native files and links. Run the tool explicitly to set up a project, synchronize
 personal configuration, or check references. Existing conflicting content is
 preserved.
 
-**[0.5.0 preview](https://github.com/kelvicthrust/agent-sync-config/releases/tag/v0.5.0).**
-Supports local macOS/Linux clients and Python 3.11+.
+Supports local macOS/Linux clients and Python 3.9+.
 The tool is stateless: each run inspects the current filesystem. There are no
 hooks, background processes, copied runtimes, launchers, custom configuration
 roots, ownership manifests, or persistent application-state directories.
@@ -22,15 +21,15 @@ npx skills add kelvicthrust/agent-sync-config \
   --skill agent-sync-config --global --agent codex claude-code
 ```
 
-This installs the default branch. To pin the 0.5.0 preview:
-
-```sh
-npx skills add https://github.com/kelvicthrust/agent-sync-config/tree/v0.5.0 \
-  --skill agent-sync-config --global --agent codex claude-code
-```
+This installs the default branch. For a pinned version, use the installation
+command in the [release notes](https://github.com/kelvicthrust/agent-sync-config/releases).
 
 For a local checkout, use its absolute path as the installation source. Ensure
-`python3` resolves to Python 3.11+.
+`python3` resolves to Python 3.9+.
+
+You do not need the latest Python version or any `pip install` step. Python 3.11+
+is recommended because [Python 3.9 is past upstream support](https://devguide.python.org/versions/);
+3.9 compatibility lets you use an existing interpreter without a forced upgrade.
 
 `--global` installs the **skill** for discovery across repositories. It does not
 synchronize personal configuration or select global execution. Restart an open

@@ -15,7 +15,7 @@ import tempfile
 
 sys.dont_write_bytecode = True
 
-VERSION = "0.5.0"
+VERSION = "0.5.1"
 NAME = "agent-sync-config"
 BEGIN = "<!-- agent-sync-config:start -->"
 END = "<!-- agent-sync-config:end -->"
@@ -731,6 +731,6 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    if sys.version_info < (3, 11):
-        sys.exit("agent-sync-config requires Python 3.11 or later")
+    if sys.version_info < (3, 9):
+        sys.exit("agent-sync-config requires Python 3.9 or later")
     sys.exit(main())
