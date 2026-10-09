@@ -14,7 +14,10 @@ python3 tests/benchmark.py
 The suite covers initialization, existing-resource adoption, conflicts,
 idempotence, installed licenses, instructions, skills, context, MCP rendering
 and ownership, native settings/plugin preservation, malformed inputs, read-only
-behavior, hooks, and cache invalidation. It does not use model credentials or
+behavior, hooks, and cache invalidation. Scope tests cover first-run selection,
+cancellation, marker detection, argument conflicts, protected targets, snapshots
+of the opposite scope, relocation/worktrees, ownership, legacy upgrade, and
+audit-only global hooks. It does not use model credentials or
 contact model providers.
 
 The benchmark measures warm metadata checks, including Python startup. It reports
@@ -30,16 +33,24 @@ commit being evaluated. CI does not require model credentials.
 ```sh
 AGENT_SYNC_DEMO=$(mktemp -d)
 mkdir -p "$AGENT_SYNC_DEMO/home" "$AGENT_SYNC_DEMO/repo"
-./bin/agent-sync-config --home "$AGENT_SYNC_DEMO/home" \
+./bin/agent-sync-config --scope project --home "$AGENT_SYNC_DEMO/home" \
   --project "$AGENT_SYNC_DEMO/repo" --json
-./bin/agent-sync-config check --home "$AGENT_SYNC_DEMO/home" \
+./bin/agent-sync-config check --scope project --home "$AGENT_SYNC_DEMO/home" \
   --project "$AGENT_SYNC_DEMO/repo" --json
-./bin/agent-sync-config --home "$AGENT_SYNC_DEMO/home" \
+./bin/agent-sync-config --scope project --home "$AGENT_SYNC_DEMO/home" \
   --project "$AGENT_SYNC_DEMO/repo" --json
 ```
 
 The check should succeed, and the second sync should report no changes. Inspect
-both directories to see the configuration footprint. Keep the explicit `--home`
+the project and external runtime state to see the footprint. Personal/provider
+configuration must remain absent. To test global setup separately, run:
+
+```sh
+./bin/agent-sync-config --scope global --home "$AGENT_SYNC_DEMO/home" --json
+./bin/agent-sync-config check --scope global --home "$AGENT_SYNC_DEMO/home" --json
+```
+
+The project must remain unchanged during those global operations. Keep the explicit `--home`
 argument on every test command; it controls the synchronizer's destination, not
 the native clients' authentication or configuration directories.
 
@@ -85,7 +96,8 @@ exercise read-only behavior. Claude also exercises safe repair in writable mode.
 No real model credentials are supplied. The protocol stub returns fixed responses
 and does not establish real model compliance.
 
-Codex's hook-trust bypass in this test is confined to the vetted disposable
+Codex requests use an explicit project skill path to disambiguate project/global
+copies. Codex's hook-trust bypass in this test is confined to the vetted disposable
 fixture hooks. Production setup and authenticated pilots use native hook review
 and trust controls.
 
@@ -93,9 +105,11 @@ and trust controls.
 
 Use a disposable Git project and synchronizer home. Preserve existing application
 files and install the skill from the checkout. Specify the fixture `--home` and
-`--project` in every skill request. Attach only the generated fixture hooks at the
-native project scope (`.codex/hooks.json` for Codex, `.claude/settings.json` for
-Claude); do not replace personal hook files. Review Codex's fixture hooks through
+`--scope project --project` in every project skill request. Setup installs
+fixture hooks at the native project scope (`.codex/hooks.json` for Codex,
+`.claude/settings.json` for Claude); do not replace personal hook files. Set HOME to the disposable home
+for portable project hooks while retaining the native login through CODEX_HOME
+if needed. Review Codex's fixture hooks through
 `/hooks`; restart Claude after attaching hooks.
 
 An authenticated pilot can use the client's existing login without copying
@@ -129,10 +143,12 @@ inspect native trust status, fixture hook logs/state, tool calls, and file chang
 
 | Environment | Verification |
 | --- | --- |
-| Codex 0.160.0 on macOS | Authenticated native CLI/app-server pilot: setup/adoption, explicit repair, checks, local MCP tool call, trusted hooks, drift reporting, and fresh/resumed instruction loading |
+| Codex 0.162.0-alpha.2 on macOS | 0.2.0 native discovery and protocol-stub sessions; authenticated trusted project hooks, drift reporting, explicit project repair/check, and fresh/resumed instruction loading |
+| Codex 0.160.0 on macOS | Previous 0.1.0 authenticated native CLI/app-server pilot: setup/adoption, explicit repair, checks, local MCP tool call, trusted hooks, drift reporting, and fresh/resumed instruction loading |
 | Codex 0.142.0 on macOS | Native discovery/parsing and protocol-stub sessions; authenticated model compatibility is not established |
 | Claude Code 2.1.295 on macOS | Native MCP loading and protocol-stub sessions, hooks, resume refresh, planning behavior, and writable repair; authenticated model compliance is not established |
-| Python 3.14.8 on macOS | Local automated suite and benchmark |
+| Python 3.12.14 on macOS | 54 automated tests passed; portable warm hook with 30 skills: 56 ms median / 60 ms p95 in a local sample |
+| Python 3.14.8 on macOS | Automated scope tests and benchmark also exercised during development |
 | Python 3.11/3.13 on macOS/Linux | CI targets; consult actual workflow results |
 
 These are tested versions, not minimum supported client versions. Desktop GUI,

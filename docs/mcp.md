@@ -2,7 +2,9 @@
 
 `.agents/mcp.json` is this project's neutral format, not a provider standard.
 Personal definitions use the same format in the registered personal root's
-`mcp.json`. A minimal manifest contains `schema: 1` and a `servers` object:
+`mcp.json`. Run `--scope project` for project definitions and `--scope global`
+for personal definitions. Synchronization and explicit `--import-mcp` adoption
+affect only the selected scope. A minimal manifest contains `schema: 1` and a `servers` object:
 
 ```json
 {

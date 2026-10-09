@@ -1,5 +1,6 @@
 """Measure the complete warm hook subprocess, including Python startup."""
 import json
+import os
 from pathlib import Path
 import statistics
 import subprocess
@@ -21,14 +22,15 @@ def main():
             (folder / "SKILL.md").write_text(f"---\nname: sample-{index}\ndescription: A fixture skill.\n---\nFixture.\n")
         subprocess.run([sys.executable, str(SCRIPT), "--home", str(home), "--project", str(repo)],
                        check=True, stdout=subprocess.DEVNULL)
-        command = [sys.executable, str(SCRIPT), "hook", "--home", str(home), "--provider", "codex"]
+        command = json.loads((repo / ".codex/hooks.json").read_text())["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
+        env = {**os.environ, "HOME": str(home)}
         payload = json.dumps({"cwd": str(repo), "session_id": "benchmark", "permission_mode": "default",
                               "hook_event_name": "UserPromptSubmit"})
-        subprocess.run(command, input=payload, text=True, capture_output=True, check=True)
+        subprocess.run(command, shell=True, env=env, cwd=repo, input=payload, text=True, capture_output=True, check=True)
         timings = []
         for _ in range(20):
             start = time.perf_counter()
-            result = subprocess.run(command, input=payload, text=True, capture_output=True, check=True)
+            result = subprocess.run(command, shell=True, env=env, cwd=repo, input=payload, text=True, capture_output=True, check=True)
             timings.append((time.perf_counter() - start) * 1000)
             if result.stdout:
                 raise AssertionError("Healthy warm hook should be silent")

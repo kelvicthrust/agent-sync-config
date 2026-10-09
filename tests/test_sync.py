@@ -7,6 +7,8 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
+import io
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "skills/agent-sync-config/scripts/agent_sync_config.py"
@@ -47,18 +49,21 @@ class ConfigurationTests(unittest.TestCase):
     def skill(self, relative, home=False, text=None):
         return self.write(relative + "/SKILL.md", text or "---\nname: review-code\ndescription: Review code.\n---\nReview changes.\n", home).parent
 
-    def run_tool(self, *args, expected=0, project=None):
-        command = [sys.executable, str(SCRIPT), *args, "--home", str(self.home),
-                   "--project", str(project or self.repo), "--json"]
+    def run_tool(self, *args, expected=0, project=None, scope="project"):
+        command = [sys.executable, str(SCRIPT), *args, "--home", str(self.home), "--json"]
+        if scope:
+            command += ["--scope", scope]
+        if scope != "global":
+            command += ["--project", str(project or self.repo)]
         result = subprocess.run(command, capture_output=True, text=True)
         self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
         return json.loads(result.stdout)
 
-    def hook(self, mode="default", provider="codex", event="UserPromptSubmit", session="test", extra=None):
+    def hook(self, mode="default", provider="codex", event="UserPromptSubmit", session="test", extra=None, scope="project"):
         payload = {"cwd": str(self.repo), "session_id": session, "permission_mode": mode, "hook_event_name": event}
         payload.update(extra or {})
         result = subprocess.run([sys.executable, str(SCRIPT), "hook", "--home", str(self.home),
-                                 "--provider", provider], input=json.dumps(payload), capture_output=True, text=True)
+                                 "--provider", provider, "--scope", scope], input=json.dumps(payload), capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         return json.loads(result.stdout) if result.stdout else {}
 
@@ -71,18 +76,20 @@ class ConfigurationTests(unittest.TestCase):
         self.assertTrue(report["changes"])
         self.assertEqual((self.repo / "README.md").read_text(), "existing")
         self.assertEqual((self.repo / "CLAUDE.md").read_text(), "@AGENTS.md\n")
-        self.assertFalse((self.repo / ".codex").exists())
+        self.assertTrue((self.repo / ".codex/hooks.json").is_file())
         self.assertFalse((self.repo / ".mcp.json").exists())
         for relative in (".agents/skills/agent-sync-config", ".claude/skills/agent-sync-config"):
-            self.assertTrue((self.home / relative / "SKILL.md").is_file())
-            self.assertTrue((self.home / relative).is_symlink())
-            self.assertEqual((self.home / relative / "LICENSE").read_bytes(), (ROOT / "LICENSE").read_bytes())
-            self.assertTrue((self.home / relative / "scripts/vendor/TOMLKIT-LICENSE").is_file())
-            self.assertTrue((self.home / relative / "scripts/vendor/NOTICE").is_file())
+            self.assertTrue((self.repo / relative / "SKILL.md").is_file())
+            self.assertEqual((self.repo / relative / "LICENSE").read_bytes(), (ROOT / "LICENSE").read_bytes())
+            self.assertTrue((self.repo / relative / "scripts/vendor/TOMLKIT-LICENSE").is_file())
+            self.assertTrue((self.repo / relative / "scripts/vendor/NOTICE").is_file())
+        self.assertTrue((self.repo / ".claude/skills/agent-sync-config").is_symlink())
+        self.assertFalse((self.home / ".local/bin/agent-sync-config").exists())
         before = snapshot(self.base)
         self.assertEqual(self.run_tool()["changes"], [])
         self.assertEqual(snapshot(self.base), before)
         self.assertEqual(self.run_tool("check")["changes"], [])
+        self.run_tool(scope="global")
         result = subprocess.run([str(self.home / ".local/bin/agent-sync-config"), "check", "--home", str(self.home),
                                  "--project", str(self.repo)], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -111,7 +118,7 @@ class ConfigurationTests(unittest.TestCase):
         self.write(".codex/AGENTS.md", "Personal A", home=True)
         other = self.write(".claude/CLAUDE.md", "Personal B", home=True)
         override = self.write(".codex/AGENTS.override.md", "Override", home=True)
-        self.run_tool(expected=1)
+        self.run_tool(expected=1, scope="global")
         self.assertEqual(other.read_text(), "Personal B")
         self.assertEqual(override.read_text(), "Override")
         self.assertTrue((self.home / ".codex/AGENTS.md").is_symlink())
@@ -119,7 +126,7 @@ class ConfigurationTests(unittest.TestCase):
     def test_matching_global_instructions_link_to_one_source(self):
         for relative in (".codex/AGENTS.md", ".claude/CLAUDE.md"):
             self.write(relative, "same", home=True)
-        self.run_tool()
+        self.run_tool(scope="global")
         self.assertEqual((self.home / ".codex/AGENTS.md").resolve(), (self.home / ".claude/CLAUDE.md").resolve())
 
     def test_project_skills_adoption_edit_and_removal(self):
@@ -137,7 +144,7 @@ class ConfigurationTests(unittest.TestCase):
     def test_legacy_global_skills_adopted_in_one_run(self):
         self.skill(".codex/skills/review-code", home=True)
         system = self.write(".codex/skills/.system/keep.txt", "system", home=True)
-        self.run_tool()
+        self.run_tool(scope="global")
         self.assertTrue((self.home / ".claude/skills/review-code").is_symlink())
         self.assertTrue((self.home / ".agents/skills/review-code").is_symlink())
         self.assertEqual(system.read_text(), "system")
@@ -229,19 +236,25 @@ class ConfigurationTests(unittest.TestCase):
         self.assertIn('command = "node" # interpreter', text)
 
     def test_disabled_hooks_are_reported_without_enabling_them(self):
-        path = self.write(".codex/config.toml", "[features]\nhooks = false\n", home=True)
+        path = self.write(".codex/config.toml", "[features]\nhooks = false\n")
         settings = self.write(".claude/settings.local.json", '{"disableAllHooks": true}')
         self.run_tool(expected=1)
         self.assertIn("hooks = false", path.read_text())
         self.assertTrue(json.loads(settings.read_text())["disableAllHooks"])
 
-    def test_global_skill_addition_and_removal_via_claude_hook(self):
-        self.run_tool()
+    def test_global_hooks_report_skill_drift_without_repair(self):
+        self.run_tool(scope="global")
         skill = self.skill("agent-config/skills/review-code", home=True)
-        self.hook(provider="claude")
+        before = snapshot(self.home / "agent-config")
+        self.assertIn("Synchronization required", json.dumps(self.hook(provider="claude", scope="global")))
+        self.assertEqual(snapshot(self.home / "agent-config"), before)
+        self.assertFalse((self.home / ".agents/skills/review-code").exists())
+        self.run_tool(scope="global")
         self.assertTrue((self.home / ".agents/skills/review-code").is_symlink())
         shutil.rmtree(skill)
-        self.hook(provider="claude")
+        self.hook(provider="claude", scope="global")
+        self.assertTrue((self.home / ".agents/skills/review-code").is_symlink())
+        self.run_tool(scope="global")
         self.assertFalse(os.path.lexists(self.home / ".agents/skills/review-code"))
 
     def test_mcp_removal_preserves_modified_and_unmanaged_servers(self):
@@ -260,7 +273,7 @@ class ConfigurationTests(unittest.TestCase):
     def test_global_mcp_preserves_private_project_and_other_settings(self):
         self.write(".claude.json", json.dumps({"theme": "dark", "projects": {"/other": {"private": True}},
                    "mcpServers": {"remote": {"type": "http", "url": "https://example.com/mcp"}}}), home=True)
-        self.run_tool()
+        self.run_tool(scope="global")
         doc = json.loads((self.home / ".claude.json").read_text())
         self.assertEqual(doc["theme"], "dark")
         self.assertEqual(doc["projects"], {"/other": {"private": True}})
@@ -325,13 +338,14 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual(json.loads(project_plugin.read_text())["enabledPlugins"], {"project@example": True})
         self.assertEqual(self.run_tool()["changes"], [])
 
-    def test_missing_skill_detected_and_hook_repairs_global_link(self):
-        self.run_tool()
+    def test_missing_global_skill_requires_explicit_global_sync(self):
+        self.run_tool(scope="global")
         (self.home / ".claude/skills/agent-sync-config").unlink()
-        self.run_tool("check", expected=1)
-        self.hook(provider="claude")
-        self.assertTrue((self.home / ".claude/skills/agent-sync-config/SKILL.md").is_file())
-        self.run_tool("check")
+        self.run_tool("check", expected=1, scope="global")
+        self.hook(provider="claude", scope="global")
+        self.assertFalse((self.home / ".claude/skills/agent-sync-config").exists())
+        self.run_tool(scope="global")
+        self.run_tool("check", scope="global")
 
     def test_hooks_normal_plan_unknown_mode_and_read_only_sandbox(self):
         self.skill(".agents/skills/review-code")
@@ -392,10 +406,11 @@ class ConfigurationTests(unittest.TestCase):
 
     def test_explicit_personal_root_is_reused_and_second_root_rejected(self):
         custom = self.home / "custom-personal"
-        self.run_tool("--personal-root", str(custom))
+        self.run_tool("--personal-root", str(custom), scope="global")
         self.assertTrue((custom / "AGENTS.md").is_file())
-        self.assertEqual(self.run_tool()["changes"], [])
-        self.run_tool("--personal-root", str(self.home / "different"), expected=2)
+        self.run_tool(project=custom, expected=2)
+        self.assertEqual(self.run_tool(scope="global")["changes"], [])
+        self.run_tool("--personal-root", str(self.home / "different"), expected=2, scope="global")
 
     def test_invalid_mcp_manifest_error_has_no_secret_contents(self):
         path = self.write(".agents/mcp.json", '{"invalid": "do-not-log"}')
@@ -424,6 +439,242 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Synchronization required", result.stdout)
         self.assertEqual(snapshot(self.base), before)
+
+    def test_fresh_unscoped_json_and_noninteractive_fail_before_writes(self):
+        before = snapshot(self.base)
+        report = self.run_tool(scope=None, expected=2)
+        self.assertTrue(report["selection_required"])
+        self.assertIsNone(report["scope"])
+        result = subprocess.run([sys.executable, str(SCRIPT), "--home", str(self.home)],
+                                cwd=self.repo, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("Scope selection required", result.stderr)
+        self.assertEqual(snapshot(self.base), before)
+
+    def test_interactive_first_run_choices_and_cancellation(self):
+        # Exercise the real terminal branch without relying on OS-specific PTYs.
+        for choice, expected_scope in (("q", None), ("", None), ("1", "project"), ("2", "global")):
+            with tempfile.TemporaryDirectory() as temporary:
+                base = Path(temporary).resolve()
+                home, repo = base / "home", base / "repo"
+                home.mkdir(); repo.mkdir()
+                before = snapshot(base)
+                output = io.StringIO()
+                with patch.object(sync.Path, "cwd", return_value=repo), \
+                     patch.object(sys.stdin, "isatty", return_value=True), \
+                     patch.object(output, "isatty", return_value=True), \
+                     patch.object(sys, "stdout", output), patch("builtins.input", return_value=choice):
+                    self.assertEqual(sync.main(["--home", str(home)]), 0)
+                if expected_scope is None:
+                    self.assertEqual(snapshot(base), before)
+                else:
+                    self.assertIn("Scope: " + expected_scope, output.getvalue())
+                    self.assertEqual((repo / "AGENTS.md").exists(), expected_scope == "project")
+                    self.assertEqual((home / "agent-config/AGENTS.md").exists(), expected_scope == "global")
+
+    def test_each_existing_marker_selects_project(self):
+        for marker in (".agents", ".claude", ".codex", "AGENTS.md", "AGENTS.override.md", "CLAUDE.md", ".mcp.json"):
+            with self.subTest(marker=marker):
+                shutil.rmtree(self.repo); self.repo.mkdir()
+                if marker in (".agents", ".claude", ".codex"):
+                    (self.repo / marker).mkdir()
+                else:
+                    self.write(marker, '{"mcpServers": {}}' if marker == ".mcp.json" else "Existing")
+                report = self.run_tool(scope=None, expected=1 if marker == "AGENTS.override.md" else 0)
+                self.assertEqual(report["scope"], "project")
+                self.assertFalse((self.home / "agent-config").exists())
+
+    def test_malformed_existing_configuration_never_selects_global(self):
+        self.write(".claude/settings.json", "invalid-json")
+        report = self.run_tool(scope=None, expected=2)
+        self.assertEqual(report["scope"], "project")
+        self.assertFalse((self.home / "agent-config").exists())
+
+    def test_unscoped_check_fresh_is_read_only_project_audit(self):
+        before = snapshot(self.base)
+        report = self.run_tool("check", scope=None, expected=1)
+        self.assertEqual(report["scope"], "project")
+        self.assertEqual(snapshot(self.base), before)
+
+    def test_argument_conflicts_and_protected_project_targets(self):
+        before = snapshot(self.base)
+        for args in (("--scope", "project", "--scope", "global"),
+                     ("--project-only", "--scope", "global"),
+                     ("--scope", "global", "--project", str(self.repo)),
+                     ("--personal-root", str(self.base / "custom")),
+                     ("--scope", "project", "--personal-root", str(self.base / "custom"))):
+            result = subprocess.run([sys.executable, str(SCRIPT), "--home", str(self.home), "--json", *args],
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode, 2, result.stdout)
+            self.assertEqual(snapshot(self.base), before)
+        for target in (self.home, self.home / "agent-config", self.home / "agent-config/skills",
+                       self.home / ".agents", self.home / ".claude", self.home / ".codex"):
+            self.run_tool(project=target, expected=2)
+            self.assertEqual(snapshot(self.base), before)
+
+    def test_explicit_global_ignores_malformed_current_project(self):
+        self.write(".agents/agent-sync.json", "invalid")
+        self.write(".claude/settings.json", "invalid")
+        before = snapshot(self.repo)
+        result = subprocess.run([sys.executable, str(SCRIPT), "--scope", "global", "--home", str(self.home), "--json"],
+                                cwd=self.repo, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["scope"], "global")
+        self.assertIsNone(report["project"])
+        self.assertEqual(snapshot(self.repo), before)
+        before = snapshot(self.base)
+        self.run_tool("check", scope="global")
+        self.assertEqual(snapshot(self.base), before)
+
+    def test_project_sync_and_hooks_preserve_personal_configuration(self):
+        self.run_tool(scope="global")
+        self.write("agent-config/AGENTS.md", "Personal instructions", home=True)
+        self.write(".claude.json", '{"projects": {"/other": {"private": true}}}', home=True)
+        def personal_snapshot():
+            return {key: value for key, value in snapshot(self.home).items()
+                    if not key.startswith(".local/state") and key != ".local"}
+        before = personal_snapshot()
+        self.skill(".agents/skills/review-code")
+        self.run_tool()
+        self.assertEqual(personal_snapshot(), before)
+        (self.repo / ".claude/skills/review-code").unlink()
+        self.hook(provider="claude")
+        self.assertTrue((self.repo / ".claude/skills/review-code").is_symlink())
+        self.assertEqual(personal_snapshot(), before)
+
+    def test_global_sync_and_hooks_preserve_project_and_never_repair_global(self):
+        self.run_tool()
+        before = snapshot(self.repo)
+        self.run_tool(scope="global")
+        self.assertEqual(snapshot(self.repo), before)
+        (self.home / ".claude/skills/agent-sync-config").unlink()
+        personal_before = {key: value for key, value in snapshot(self.home).items()
+                           if not key.startswith(".local/state") and key != ".local"}
+        for provider in ("claude", "codex"):
+            output = self.hook(provider=provider, scope="global", extra={"sandbox_mode": "workspace-write"})
+            self.assertIn("--scope global", json.dumps(output))
+            self.assertFalse((self.home / ".claude/skills/agent-sync-config").exists())
+        after = {key: value for key, value in snapshot(self.home).items()
+                 if not key.startswith(".local/state") and key != ".local"}
+        self.assertEqual(after, personal_before)
+        self.assertEqual(snapshot(self.repo), before)
+
+    def test_portable_project_hooks_after_relocation_nested_worktree_and_new_home(self):
+        self.write(".git", "gitdir: /elsewhere/worktrees/fixture\n")
+        self.skill(".agents/skills/review-code")
+        self.run_tool()
+        commands = json.loads((self.repo / ".codex/hooks.json").read_text())["hooks"]
+        command = commands["UserPromptSubmit"][0]["hooks"][0]["command"]
+        self.assertNotIn(str(self.repo), command)
+        self.assertNotIn(str(self.home), command)
+        relocated = self.base / "relocated checkout"
+        self.repo.rename(relocated)
+        nested = relocated / "src/nested"; nested.mkdir(parents=True)
+        new_home = self.base / "new home"; new_home.mkdir()
+        payload = {"cwd": str(nested), "permission_mode": "default", "sandbox_mode": "workspace-write",
+                   "session_id": "relocated", "hook_event_name": "UserPromptSubmit"}
+        link = relocated / ".claude/skills/review-code"; link.unlink()
+        result = subprocess.run(command, shell=True, input=json.dumps(payload), cwd=nested,
+                                env={**os.environ, "HOME": str(new_home)}, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(link.is_symlink())
+        self.assertIn("Read AGENTS.md", result.stdout)
+        self.assertFalse((new_home / "agent-config").exists())
+        result = subprocess.run(command, shell=True, input=json.dumps(payload), cwd=nested,
+                                env={**os.environ, "HOME": str(new_home)}, capture_output=True, text=True)
+        self.assertEqual(result.stdout, "", result.stderr)
+
+    def test_project_hook_ownership_and_local_runtime_edits(self):
+        self.write(".codex/hooks.json", json.dumps({"hooks": {"SessionStart": [
+            {"matcher": "startup", "hooks": [{"type": "command", "command": "unrelated"}]}]}}))
+        self.run_tool()
+        doc = json.loads((self.repo / ".codex/hooks.json").read_text())
+        self.assertEqual(doc["hooks"]["SessionStart"][0]["matcher"], "startup")
+        self.assertEqual(doc["hooks"]["SessionStart"][0]["hooks"][0]["command"], "unrelated")
+        manifest = json.loads((self.repo / ".agents/agent-sync.json").read_text())
+        self.assertEqual(set(manifest["hook_commands"]), {"codex", "claude"})
+        runtime = self.repo / ".agents/skills/agent-sync-config/scripts/agent_sync_config.py"
+        runtime.write_text(runtime.read_text() + "\n# local edit\n")
+        self.assertIn("local edits", json.dumps(self.run_tool(expected=1)))
+        self.assertTrue(runtime.read_text().endswith("# local edit\n"))
+
+    def test_legacy_global_upgrade_is_explicit_and_project_registration_not_global_authority(self):
+        self.run_tool(scope="global")
+        registry_path = self.home / ".local/state/agent-sync-config/registry.json"
+        registry = json.loads(registry_path.read_text())
+        registry.pop("global_hooks_audit_only")
+        registry["projects"][str(self.repo)] = {"project_only": False}
+        for provider, path in (("codex", self.home / ".codex/hooks.json"), ("claude", self.home / ".claude/settings.json")):
+            doc = json.loads(path.read_text())
+            old_command = "legacy-combined-" + provider
+            for event in ("SessionStart", "UserPromptSubmit"):
+                doc["hooks"][event][0]["hooks"][0]["command"] = old_command
+            path.write_text(json.dumps(doc))
+            registry["hook_commands"][provider] = [old_command]
+        registry_path.write_text(json.dumps(registry))
+        before = snapshot(self.home / ".codex")
+        self.assertIn("Legacy global hooks", json.dumps(self.run_tool()["notes"]))
+        self.assertEqual(snapshot(self.home / ".codex"), before)
+        (self.home / ".claude/skills/agent-sync-config").unlink()
+        self.hook(provider="claude")
+        self.assertFalse((self.home / ".claude/skills/agent-sync-config").exists())
+        self.run_tool(scope="global")
+        registry = json.loads(registry_path.read_text())
+        self.assertTrue(registry["global_hooks_audit_only"])
+        self.assertNotIn("legacy-combined", (self.home / ".codex/hooks.json").read_text())
+        self.assertIn("--scope global", (self.home / ".codex/hooks.json").read_text())
+
+    def test_explicit_imports_apply_only_to_selected_scope(self):
+        skill = self.base / "portable"; skill.mkdir()
+        (skill / "SKILL.md").write_text("Portable skill")
+        mcp = self.base / "import.json"
+        mcp.write_text('{"mcpServers": {"local": {"command": "python3"}}}')
+        self.run_tool("--import-skill", str(skill), "--import-mcp", str(mcp), scope="global")
+        self.assertTrue((self.home / "agent-config/skills/portable/SKILL.md").is_file())
+        self.assertTrue((self.home / "agent-config/mcp.json").is_file())
+        self.assertEqual(list(self.repo.iterdir()), [])
+        before = snapshot(self.home / "agent-config")
+        self.run_tool("--import-skill", str(skill), "--import-mcp", str(mcp))
+        self.assertTrue((self.repo / ".agents/skills/portable/SKILL.md").is_file())
+        self.assertEqual(snapshot(self.home / "agent-config"), before)
+
+    def test_project_settings_symlink_never_changes_global_permissions(self):
+        settings = self.write(".claude/settings.json", "{}", home=True)
+        settings.chmod(0o644)
+        directory = self.repo / ".claude"; directory.mkdir()
+        (directory / "settings.json").symlink_to(settings)
+        before = snapshot(self.home / ".claude")
+        self.run_tool(expected=2)
+        self.assertEqual(snapshot(self.home / ".claude"), before)
+
+    def test_strict_read_only_hook_in_clone_does_not_create_runtime_state(self):
+        self.run_tool()
+        shutil.rmtree(self.home / ".local")
+        before = snapshot(self.base)
+        payload = {"cwd": str(self.repo), "permission_mode": "default", "session_id": "clone"}
+        result = subprocess.run([sys.executable, str(SCRIPT), "hook", "--scope", "project", "--provider", "claude", "--home", str(self.home)],
+                                input=json.dumps(payload), capture_output=True, text=True,
+                                env={**os.environ, "AGENT_SYNC_READ_ONLY": "1"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(snapshot(self.base), before)
+
+    def test_read_only_project_and_global_hooks_do_not_contend_with_sync_lock(self):
+        self.run_tool(); self.run_tool(scope="global")
+        with sync.lock(self.home):
+            for scope in ("project", "global"):
+                output = self.hook(mode="plan", scope=scope)
+                self.assertNotIn("could not verify", json.dumps(output))
+                self.assertIn("Read", json.dumps(output))
+
+    def test_project_hooks_audit_missing_native_handlers_without_reinstalling(self):
+        self.run_tool()
+        (self.repo / ".claude/settings.json").unlink()
+        output = self.hook(provider="claude")
+        self.assertIn("Synchronization required", json.dumps(output))
+        self.assertFalse((self.repo / ".claude/settings.json").exists())
+        self.run_tool()
+        self.assertTrue((self.repo / ".claude/settings.json").exists())
 
 
 if __name__ == "__main__":

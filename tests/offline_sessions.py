@@ -2,7 +2,7 @@
 
 This script needs installed provider binaries and localhost socket access. It
 creates all config in temporary homes. Its Codex hook-trust bypass applies only
-to the two fixture hooks authored/generated here; production setup never uses it.
+to the scoped fixture hooks authored/generated here; production setup never uses it.
 """
 import argparse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -129,7 +129,9 @@ def main():
             (repo / ".agents/mcp.json").write_text(json.dumps({"schema": 1, "servers": {
                 "local-probe": {"transport": "stdio", "command": sys.executable,
                                 "args": [str(ROOT / "tests/fixtures/mcp_server.py")]}}}))
-            subprocess.run([sys.executable, str(SCRIPT), "--home", str(home), "--project", str(repo)],
+            subprocess.run([sys.executable, str(SCRIPT), "--scope", "global", "--home", str(home)],
+                           env=env, check=True, stdout=subprocess.DEVNULL)
+            subprocess.run([sys.executable, str(SCRIPT), "--scope", "project", "--home", str(home), "--project", str(repo)],
                            env=env, check=True, stdout=subprocess.DEVNULL)
             config = home / ".codex/config.toml"
             config.write_text(f'model = "fixture"\nmodel_provider = "fixture"\n'
@@ -143,7 +145,7 @@ def main():
             if args.codex:
                 link.unlink()
                 command = [args.codex, "exec", "--dangerously-bypass-hook-trust", "--sandbox", "read-only", "--json"]
-                sent, _ = session([*command, "$agent-sync-config check"], env, repo)
+                sent, _ = session([*command, f"[$agent-sync-config]({repo / '.agents/skills/agent-sync-config/SKILL.md'}) check"], env, repo)
                 serialized = json.dumps(sent)
                 assert all(token in serialized for token in ("PROJECT_INSTRUCTIONS_SENTINEL", "PERSONAL_INSTRUCTIONS_SENTINEL"))
                 assert "fixture_echo" in serialized, "Codex did not connect to the local MCP fixture"
@@ -151,7 +153,7 @@ def main():
                 assert any(json.loads(path.read_text()).get("sessions") for path in cache_dir.glob("*.json")), "Native hooks did not cache session metadata"
                 with (repo / "AGENTS.md").open("a") as stream:
                     stream.write("\nUPDATED_INSTRUCTIONS_SENTINEL\n")
-                resumed, _ = session([*command, "resume", "--last", "$agent-sync-config check"], env, repo)
+                resumed, _ = session([*command, "resume", "--last", f"[$agent-sync-config]({repo / '.agents/skills/agent-sync-config/SKILL.md'}) check"], env, repo)
                 assert "Read AGENTS.md" in json.dumps(resumed), "Resumed session did not receive the instruction refresh cue"
                 assert not link.exists()
                 report["codex"] = "instructions, skill invocation, native hooks, MCP connection, read-only behavior, and resume refresh passed"

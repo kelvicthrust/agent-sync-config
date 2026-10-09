@@ -59,7 +59,7 @@ def codex_discovery(binary, env, repo):
         raise AssertionError(f"Codex did not respond to {method}")
 
     try:
-        request(1, "initialize", {"clientInfo": {"name": "agent-sync-smoke", "version": "0.1.0"},
+        request(1, "initialize", {"clientInfo": {"name": "agent-sync-smoke", "version": "0.2.0"},
                                   "capabilities": {"experimentalApi": True}})
         send({"method": "initialized", "params": {}})
         skills = request(2, "skills/list", {"cwds": [str(repo)], "forceReload": True})
@@ -71,6 +71,8 @@ def codex_discovery(binary, env, repo):
         assert not any(entry["errors"] for entry in hooks["data"]), hooks
         handlers = [hook for entry in hooks["data"] for hook in entry["hooks"]]
         assert {"sessionStart", "userPromptSubmit"} <= {hook["eventName"] for hook in handlers}, hooks
+        assert len(handlers) == 4, hooks
+        assert any(str(repo / ".codex/hooks.json") == hook["sourcePath"] for hook in handlers), hooks
         config = request(4, "config/read", {"cwd": str(repo), "includeLayers": True})
         assert "local-probe" in config["config"].get("mcp_servers", {}), config
         return {"skill_discovery": "passed", "hook_parsing": "passed", "mcp_config_loading": "passed",
@@ -121,7 +123,8 @@ def main():
                 assert (installed / "scripts/vendor/TOMLKIT-LICENSE").is_file()
                 assert (installed / "scripts/vendor/NOTICE").is_file()
             report["skills_cli_installation"] = "passed"
-        run([sys.executable, str(SCRIPT), "--home", str(home), "--project", str(repo)], env, repo)
+        run([sys.executable, str(SCRIPT), "--scope", "global", "--home", str(home)], env, repo)
+        run([sys.executable, str(SCRIPT), "--scope", "project", "--home", str(home), "--project", str(repo)], env, repo)
         # Trust only this disposable test project's config layer; hooks retain native trust requirements.
         config = home / ".codex/config.toml"
         config.write_text((config.read_text() if config.exists() else "") +

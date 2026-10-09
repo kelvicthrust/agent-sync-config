@@ -19,7 +19,7 @@ from contextlib import contextmanager
 
 sys.dont_write_bytecode = True
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 NAME = "agent-sync-config"
 SCHEMA = 1
 SKILL = Path(__file__).resolve().parents[1]
@@ -36,11 +36,14 @@ report drift or conflicts, or when switching clients without an automatic check.
 Claude Code: /agent-sync-config. Codex CLI/IDE: $agent-sync-config.
 Codex desktop: select agent-sync-config with @.
 
-For read-only verification, run `agent-sync-config check` from this repository.
+Project synchronization uses `--scope project`; global configuration changes
+require a separate explicit `--scope global` command and do not modify this repo.
+For read-only verification, run `agent-sync-config check --scope project`.
 Edit shared instructions here, skills in `.agents/skills/`, context in
 `.agents/context/`, and MCP definitions in `.agents/mcp.json`.
-Preserve conflicting content and reconcile it before syncing. References to the
-skill do not install it; automatic checks require enabled, trusted hooks.
+Project setup packages this skill in `.agents/skills/agent-sync-config/`.
+Preserve conflicting content and reconcile it before syncing. References alone
+do not install skills; automatic checks require enabled, trusted hooks.
 {END}
 """
 ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -159,6 +162,39 @@ def root_for(path: Path) -> Path:
         if (candidate / ".agents/agent-sync.json").is_file():
             return candidate
     return path
+
+
+def project_hook_command(provider: str) -> str:
+    # The native hook supplies cwd on stdin. Locate the vendored runtime before
+    # loading it, even when invoked from a nested directory or a moved checkout.
+    bootstrap = '''import io,json,os,runpy,sys
+from pathlib import Path
+raw=sys.stdin.read()
+event="UserPromptSubmit"
+try:
+    payload=json.loads(raw)
+    event=payload.get("hook_event_name",event)
+    cwd=Path(payload.get("cwd",os.getcwd())).resolve()
+    candidates=(cwd,*cwd.parents)
+    root=next((p for p in candidates if (p/".git").exists()),None)
+    if root is None:
+        root=next((p for p in candidates if (p/".agents/agent-sync.json").is_file()),cwd)
+    script=root/".agents/skills/agent-sync-config/scripts/agent_sync_config.py"
+    if not script.is_file():
+        raise OSError("Missing project runtime")
+except (OSError,ValueError,TypeError,AttributeError):
+    print(json.dumps({"hookSpecificOutput":{"hookEventName":event,"additionalContext":"agent-sync-config: project hook cannot locate its runtime. Run agent-sync-config --scope project."}}))
+    sys.exit(0)
+sys.stdin=io.StringIO(raw)
+sys.argv=[str(script),"hook","--scope","project","--provider",sys.argv[1]]
+runpy.run_path(str(script),run_name="__main__")
+'''
+    return shlex.join(["python3", "-c", bootstrap, provider])
+
+
+def project_config_exists(root: Path) -> bool:
+    return any(exists(root / name) for name in (".agents", ".claude", ".codex",
+               "AGENTS.md", "AGENTS.override.md", "CLAUDE.md", ".mcp.json"))
 
 
 def strip_guidance(text: str) -> str:
@@ -297,10 +333,10 @@ def import_server(native: dict, provider: str) -> dict:
 
 
 class Sync:
-    def __init__(self, home: Path, root: Path, apply: bool, personal: Path | None = None,
-                 project_only: bool = False, hook: bool = False):
+    def __init__(self, home: Path, root: Path | None, apply: bool, personal: Path | None = None,
+                 scope: str = "project", hook: bool = False):
         self.home, self.root, self.apply = home, root, apply
-        self.project_only, self.hook = project_only, hook
+        self.scope, self.hook = scope, hook
         self.state_dir = home / ".local/state/agent-sync-config"
         self.registry_path = self.state_dir / "registry.json"
         self.registry = read_json(self.registry_path, {"schema": SCHEMA, "projects": {}})
@@ -314,7 +350,11 @@ class Sync:
         self.issues: list[str] = []
         self.changes: list[str] = []
         self.notes: list[str] = []
-        self.old = read_json(root / ".agents/agent-sync.json", None)
+        if scope == "project":
+            if root == home or root.is_relative_to(self.personal) or any(
+                    root.is_relative_to(home / name) for name in (".agents", ".claude", ".codex")):
+                raise ConfigError("Choose a project directory outside personal/global configuration, or use --scope global")
+        self.old = read_json(root / ".agents/agent-sync.json", None) if scope == "project" else None
         if self.old is not None and (self.old.get("schema") != SCHEMA or
                                      not isinstance(self.old.get("links"), dict) or
                                      not isinstance(self.old.get("mcp"), dict)):
@@ -324,7 +364,8 @@ class Sync:
         validate_links(self.manifest["links"])
 
     def safe_parent(self, path: Path):
-        bases = sorted((self.root, self.personal, self.home), key=lambda item: len(item.parts), reverse=True)
+        allowed = (self.root, self.state_dir) if self.scope == "project" else (self.personal, self.home)
+        bases = sorted(allowed, key=lambda item: len(item.parts), reverse=True)
         for base in bases:
             if path.is_relative_to(base):
                 for parent in path.parents:
@@ -333,6 +374,7 @@ class Sync:
                     if parent.is_symlink():
                         raise ConfigError(f"Refusing to write through a linked configuration directory: {parent}")
                 return
+        raise ConfigError(f"Refusing to write outside {self.scope} scope: {path}")
 
     def issue(self, message: str):
         if message not in self.issues:
@@ -362,6 +404,8 @@ class Sync:
 
     def write(self, path: Path, text: str, mode: int | None = None):
         self.safe_parent(path)
+        if path.is_symlink():
+            raise ConfigError(f"Refusing to replace a configuration symlink: {path}")
         if exists(path) and path.is_file() and path.read_text() == text:
             if mode is not None and path.stat().st_mode & 0o777 != mode:
                 self.changed(f"Set permissions: {path}")
@@ -371,8 +415,6 @@ class Sync:
         self.changed(f"Update: {path}")
         if not self.apply:
             return
-        if path.is_symlink():
-            raise ConfigError(f"Refusing to replace a configuration symlink: {path}")
         self.backup(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as stream:
@@ -664,7 +706,8 @@ class Sync:
     def import_skill(self, source: Path):
         source = source.expanduser().resolve()
         portable_skill(source)
-        target = self.root / ".agents/skills" / source.name
+        canonical = self.root / ".agents/skills" if self.scope == "project" else self.personal / "skills"
+        target = canonical / source.name
         if exists(target):
             if tree_digest(target) != tree_digest(source):
                 self.issue(f"Imported skill conflicts (preserved): {target}")
@@ -675,18 +718,22 @@ class Sync:
             shutil.copytree(source, target)
 
     def install_hooks(self):
+        global_scope = self.scope == "global"
+        base = self.home if global_scope else self.root
+        records = self.registry if global_scope else self.manifest
         script = self.personal / "skills/agent-sync-config/scripts/agent_sync_config.py"
-        for provider, path in (("codex", self.home / ".codex/hooks.json"),
-                               ("claude", self.home / ".claude/settings.json")):
+        for provider, path in (("codex", base / ".codex/hooks.json"),
+                               ("claude", base / ".claude/settings.json")):
             doc = read_json(path, {})
             if doc.get("disableAllHooks"):
                 self.issue(f"Hooks disabled by existing settings (preserved): {path}")
             hooks = doc.setdefault("hooks", {})
             if not isinstance(hooks, dict):
                 raise ConfigError(f"Expected hooks object: {path}")
-            command = shlex.join([sys.executable, str(script), "hook", "--provider", provider,
-                                  "--home", str(self.home)])
-            old_commands = self.registry.setdefault("hook_commands", {}).get(provider, [])
+            command = (shlex.join([sys.executable, str(script), "hook", "--scope", "global",
+                                  "--provider", provider, "--home", str(self.home)])
+                       if global_scope else project_hook_command(provider))
+            old_commands = records.setdefault("hook_commands", {}).get(provider, [])
             for event in ("SessionStart", "UserPromptSubmit"):
                 entries = hooks.setdefault(event, [])
                 if not isinstance(entries, list):
@@ -712,29 +759,12 @@ class Sync:
                     updated.append({"hooks": [{"type": "command", "command": command, "timeout": 5}]})
                 hooks[event] = updated
             self.write(path, json_text(doc), 0o600)
-            self.registry["hook_commands"][provider] = [command]
+            records["hook_commands"][provider] = [command]
+        if global_scope:
+            self.registry["global_hooks_audit_only"] = True
         self.notes.append("Review/trust Codex hook definitions in /hooks. Restart Claude Code after initial hook installation. External policy can disable hooks; file presence does not prove execution.")
 
-    def personal_setup(self):
-        personal_manifest_path = self.personal / ".agent-sync.json"
-        state = read_json(personal_manifest_path, {"schema": SCHEMA, "links": {}, "mcp": {}})
-        if state.get("schema") != SCHEMA or not isinstance(state.get("links"), dict) or not isinstance(state.get("mcp"), dict):
-            raise ConfigError("Unsupported personal manifest")
-        validate_links(state["links"], personal=True)
-        if self.personal.is_relative_to(self.root):
-            raise ConfigError("Personal defaults must live outside the project repository")
-        self.mkdir(self.personal)
-        agents = self.personal / "AGENTS.md"
-        candidates = [path for path in (self.home / ".codex/AGENTS.md", self.home / ".claude/CLAUDE.md")
-                      if path.is_file() and path.resolve() != agents.resolve()]
-        text = agents.read_text() if agents.exists() else candidates[0].read_text() if candidates else "# Personal agent instructions\n"
-        self.write(agents, text)
-        for path in (self.home / ".codex/AGENTS.md", self.home / ".claude/CLAUDE.md"):
-            self.link(path, agents, state["links"], str(path.relative_to(self.home)))
-        if exists(self.home / ".codex/AGENTS.override.md"):
-            self.issue("Global AGENTS.override.md masks shared personal instructions in Codex")
-        canonical = self.personal / "skills"
-        self.mkdir(canonical)
+    def install_runtime(self, canonical: Path, state: dict):
         target = canonical / NAME
         source_hash = tree_digest(SKILL)
         if not exists(target):
@@ -759,13 +789,38 @@ class Sync:
                             state["tool_digest"] = source_hash
                 else:
                     state["tool_digest"] = source_hash
+        else:
+            state.setdefault("tool_digest", source_hash)
+        return target
+
+    def personal_setup(self, imported_skill=None, imported_mcp=None):
+        personal_manifest_path = self.personal / ".agent-sync.json"
+        state = read_json(personal_manifest_path, {"schema": SCHEMA, "links": {}, "mcp": {}})
+        if state.get("schema") != SCHEMA or not isinstance(state.get("links"), dict) or not isinstance(state.get("mcp"), dict):
+            raise ConfigError("Unsupported personal manifest")
+        validate_links(state["links"], personal=True)
+        self.mkdir(self.personal)
+        agents = self.personal / "AGENTS.md"
+        candidates = [path for path in (self.home / ".codex/AGENTS.md", self.home / ".claude/CLAUDE.md")
+                      if path.is_file() and path.resolve() != agents.resolve()]
+        text = agents.read_text() if agents.exists() else candidates[0].read_text() if candidates else "# Personal agent instructions\n"
+        self.write(agents, text)
+        for path in (self.home / ".codex/AGENTS.md", self.home / ".claude/CLAUDE.md"):
+            self.link(path, agents, state["links"], str(path.relative_to(self.home)))
+        if exists(self.home / ".codex/AGENTS.override.md"):
+            self.issue("Global AGENTS.override.md masks shared personal instructions in Codex")
+        canonical = self.personal / "skills"
+        self.mkdir(canonical)
+        target = self.install_runtime(canonical, state)
         targets = [self.home / ".agents/skills", self.home / ".claude/skills"]
         # Adopt legacy Codex skills without touching its .system directory.
         legacy = self.home / ".codex/skills"
         if legacy.is_dir():
             targets.append(legacy)
+        if imported_skill:
+            self.import_skill(imported_skill)
         self.skills(canonical, targets, state["links"], self.home)
-        self.mcp(self.personal / "mcp.json", state["mcp"], personal=True)
+        self.mcp(self.personal / "mcp.json", state["mcp"], personal=True, imported=imported_mcp)
         if self.apply:
             self.registry["personal_root"] = str(self.personal)
         self.install_hooks()
@@ -773,75 +828,47 @@ class Sync:
         self.write(self.home / ".local/bin/agent-sync-config", wrapper, 0o755)
         self.write(personal_manifest_path, json_text(state))
 
-    def repair_personal(self):
-        """Hooks repair links/render shared MCP; installation and adoption stay explicit."""
-        path = self.personal / ".agent-sync.json"
-        state = read_json(path, None)
-        if state is None or state.get("schema") != SCHEMA:
-            self.issue("Personal management state is missing; rerun setup explicitly")
-            return
-        validate_links(state["links"], personal=True)
-        for key, relative in list(state["links"].items()):
-            target = self.home / key
-            source = self.personal / "AGENTS.md" if key in {".codex/AGENTS.md", ".claude/CLAUDE.md"} else self.personal / "skills" / target.name
-            if not exists(target) and source.exists():
-                self.link(target, source, state["links"], key)
-            elif "/skills/" in key and not source.exists():
-                if target.is_symlink() and os.readlink(target) == relative:
-                    self.safe_parent(target)
-                    self.changed(f"Remove obsolete personal skill link: {target}")
-                    if self.apply:
-                        target.unlink()
-                        del state["links"][key]
-                elif exists(target):
-                    self.issue(f"Modified obsolete personal skill link (preserved): {target}")
-        canonical = self.personal / "skills"
-        targets = [self.home / ".agents/skills", self.home / ".claude/skills"]
-        if (self.home / ".codex/skills").is_dir():
-            targets.append(self.home / ".codex/skills")
-        if canonical.is_dir():
-            for source in canonical.iterdir():
-                if not SKILL_NAME.fullmatch(source.name) or not (source / "SKILL.md").is_file():
-                    continue
-                for directory in targets:
-                    target = directory / source.name
-                    if not exists(target):
-                        self.link(target, source, state["links"], str(target.relative_to(self.home)))
-        self.mcp(self.personal / "mcp.json", state["mcp"], personal=True)
-        self.write(path, json_text(state))
-
     def run(self, imported_skill: Path | None = None, imported_mcp: Path | None = None):
-        if self.home == Path.home().resolve():
-            if os.environ.get("CODEX_HOME") and Path(os.environ["CODEX_HOME"]).expanduser().resolve() != self.home / ".codex":
-                self.issue("Nondefault CODEX_HOME is not supported by this adapter; use default native paths before claiming integration")
-            if os.environ.get("CLAUDE_CONFIG_DIR"):
-                self.issue("CLAUDE_CONFIG_DIR override is not supported by this adapter; use default native paths before claiming integration")
-        if not self.project_only:
-            self.personal_setup()
+        if self.scope == "global":
+            if self.home == Path.home().resolve():
+                if os.environ.get("CODEX_HOME") and Path(os.environ["CODEX_HOME"]).expanduser().resolve() != self.home / ".codex":
+                    self.issue("Nondefault CODEX_HOME is not supported by the global adapter")
+                if os.environ.get("CLAUDE_CONFIG_DIR"):
+                    self.issue("CLAUDE_CONFIG_DIR override is not supported by the global adapter")
+            self.personal_setup(imported_skill, imported_mcp)
+            if self.apply and not self.hook:
+                self.write(self.registry_path, json_text(self.registry), 0o600)
+            return self
         self.mkdir(self.root / ".agents")
+        self.manifest["scope"] = "project"
         self.context()
         self.instructions()
         if imported_skill:
             self.import_skill(imported_skill)
+        canonical = self.root / ".agents/skills"
+        self.mkdir(canonical)
+        if not self.hook:
+            self.install_runtime(canonical, self.manifest)
+            self.install_hooks()
+        else:
+            if not (canonical / NAME / "scripts/agent_sync_config.py").is_file():
+                self.issue("Project runtime is missing; run agent-sync-config --scope project")
+            if not self.apply:
+                self.install_hooks()  # Audit definitions; native trust changes stay explicit.
         targets = [self.root / ".claude/skills"]
         if (self.root / ".codex/skills").is_dir():
             targets.append(self.root / ".codex/skills")
-        self.skills(self.root / ".agents/skills", targets, self.manifest["links"], self.root)
+        self.skills(canonical, targets, self.manifest["links"], self.root)
         for settings in (self.root / ".claude/settings.json", self.root / ".claude/settings.local.json"):
             if read_json(settings, {}).get("disableAllHooks"):
                 self.issue(f"Claude hooks are disabled by project settings (preserved): {settings}")
         self.mcp(self.root / ".agents/mcp.json", self.manifest["mcp"], imported=imported_mcp)
         self.write(self.root / ".agents/agent-sync.json", json_text(self.manifest))
         if self.apply and not self.hook:
-            self.registry["projects"][str(self.root)] = {"project_only": self.project_only}
+            self.registry["projects"][str(self.root)] = {"scope": "project"}
             self.write(self.registry_path, json_text(self.registry), 0o600)
-        if not self.project_only:
-            for provider, path in (("Codex", self.home / ".agents/skills" / NAME / "SKILL.md"),
-                                   ("Claude", self.home / ".claude/skills" / NAME / "SKILL.md")):
-                if not path.is_file():
-                    self.issue(f"Setup skill is not discoverable by {provider}: {path}")
-        else:
-            self.notes.append("Project-only mode: machine skill installation and automatic hooks were not configured.")
+        if self.registry.get("hook_commands") and not self.registry.get("global_hooks_audit_only"):
+            self.notes.append("Legacy global hooks may still repair personal resources. Upgrade them explicitly with agent-sync-config --scope global; project setup leaves them untouched.")
         return self
 
 
@@ -862,15 +889,17 @@ def stamp(path: Path):
 
 
 def fingerprint(sync: Sync):
-    paths = [sync.root / name for name in (".git", "AGENTS.md", "AGENTS.override.md", "CLAUDE.md",
-             ".claude/CLAUDE.md", ".agents/agent-sync.json", ".agents/mcp.json", ".mcp.json", ".codex/config.toml",
-             ".agents/context", ".claude/context", ".codex/context", ".claude/settings.json", ".claude/settings.local.json")]
-    skill_dirs = [sync.root / name for name in (".agents/skills", ".claude/skills", ".codex/skills")]
-    if not sync.project_only:
-        paths += [sync.registry_path, sync.personal / ".agent-sync.json", sync.personal / "AGENTS.md", sync.personal / "mcp.json"]
+    if sync.scope == "project":
+        paths = [sync.root / name for name in (".git", "AGENTS.md", "AGENTS.override.md", "CLAUDE.md",
+                 ".claude/CLAUDE.md", ".agents/agent-sync.json", ".agents/mcp.json", ".mcp.json", ".codex/config.toml",
+                 ".codex/hooks.json", ".agents/context", ".claude/context", ".codex/context",
+                 ".claude/settings.json", ".claude/settings.local.json")]
+        skill_dirs = [sync.root / name for name in (".agents/skills", ".claude/skills", ".codex/skills")]
+    else:
+        paths = [sync.registry_path, sync.personal / ".agent-sync.json", sync.personal / "AGENTS.md", sync.personal / "mcp.json"]
         paths += [sync.home / name for name in (".codex/AGENTS.md", ".codex/AGENTS.override.md", ".claude/CLAUDE.md",
                   ".codex/config.toml", ".claude.json", ".codex/hooks.json", ".claude/settings.json", ".local/bin/agent-sync-config")]
-        skill_dirs += [sync.personal / "skills", sync.home / ".agents/skills", sync.home / ".claude/skills", sync.home / ".codex/skills"]
+        skill_dirs = [sync.personal / "skills", sync.home / ".agents/skills", sync.home / ".claude/skills", sync.home / ".codex/skills"]
     result = {str(path): stamp(path) for path in paths}
     for directory in skill_dirs:
         result[str(directory)] = stamp(directory)
@@ -900,15 +929,20 @@ def lock(home: Path):
 
 def hook(args):
     event = "UserPromptSubmit"
+    scope = args.scope or "project"
     try:
         payload = json.load(sys.stdin)
         if not isinstance(payload, dict):
             raise ConfigError("Hook input must be an object")
-        root = root_for(Path(payload.get("cwd", os.getcwd())))
         home = Path(args.home).expanduser().resolve()
-        registry = read_json(home / ".local/state/agent-sync-config/registry.json", {"projects": {}})
-        registration = registry.get("projects", {}).get(str(root))
-        if registration is None:
+        scope = args.scope or "project"  # Legacy handlers never authorize global repair.
+        root = root_for(Path(payload.get("cwd", os.getcwd()))) if scope == "project" else None
+        sync = Sync(home, root, False, scope=scope, hook=True)
+        if scope == "project":
+            registration = sync.registry.get("projects", {}).get(str(root))
+            if sync.old is None or (sync.old.get("scope") != "project" and registration is None):
+                return 0
+        elif not (sync.personal / ".agent-sync.json").is_file():
             return 0
         # Unknown permission modes fail closed for mutation, but still audit.
         writable = payload.get("permission_mode") in {"default", "acceptEdits", "auto", "dontAsk", "bypassPermissions"}
@@ -917,11 +951,12 @@ def hook(args):
         if args.provider == "codex":
             writable = writable and payload.get("sandbox_mode") in {"workspace-write", "danger-full-access"}
         writable = writable and payload.get("sandbox_mode") != "read-only" and os.environ.get("AGENT_SYNC_READ_ONLY") != "1"
-        sync = Sync(home, root, False, project_only=registration["project_only"], hook=True)
-        cache_path = sync.state_dir / "cache" / (digest(str(root).encode())[:24] + ".json")
+        writable = writable and scope == "project"
+        cache_key = scope + ":" + str(root if scope == "project" else sync.personal)
+        cache_path = sync.state_dir / "cache" / (digest(cache_key.encode())[:24] + ".json")
         cache = read_json(cache_path, {})
         current = fingerprint(sync)
-        instruction_stamp = [stamp(root / "AGENTS.md"), stamp(sync.personal / "AGENTS.md") if not sync.project_only else None]
+        instruction_stamp = [stamp((root if scope == "project" else sync.personal) / "AGENTS.md")]
         event = payload.get("hook_event_name", "UserPromptSubmit")
         session = args.provider + ":" + str(payload.get("session_id", "unknown"))
         previous_instructions = cache.get("sessions", {}).get(session)
@@ -929,21 +964,18 @@ def hook(args):
         if cache.get("healthy") and cache.get("fingerprint") == current:
             pass
         else:
-            with lock(home):
-                sync.run()
-                if sync.changes and writable:
-                    # Prompt hooks repair project resources, never install/upgrade machine files.
-                    repair = Sync(home, root, True, project_only=True, hook=True)
-                    repair.run()
-                    if not registration["project_only"]:
-                        repair.repair_personal()
-                    sync = Sync(home, root, False, project_only=registration["project_only"], hook=True).run()
+            sync.run()
+            if sync.changes and writable:
+                # Audit-only handlers do not contend with project repairs.
+                with lock(home):
+                    Sync(home, root, True, scope="project", hook=True).run()
+                    sync = Sync(home, root, False, scope="project", hook=True).run()
         messages = sync.issues + ["Synchronization required: " + change for change in sync.changes]
         if refresh:
-            messages.append("Read AGENTS.md and shared personal instructions before continuing; their content may have changed. Curated .agents/context/ files are read when relevant.")
+            messages.append("Read AGENTS.md before continuing; its content may have changed. Curated .agents/context/ files are read when relevant." if scope == "project" else "Read shared personal AGENTS.md before continuing; its content may have changed.")
         if messages:
             print(json.dumps({"hookSpecificOutput": {"hookEventName": event,
-                  "additionalContext": "agent-sync-config: " + "\n".join(messages) + "\nUse the agent-sync-config skill to reconcile reported conflicts before unrelated work."}}))
+                  "additionalContext": "agent-sync-config: " + "\n".join(messages) + f"\nUse agent-sync-config --scope {scope} to reconcile reported conflicts before unrelated work."}}))
         if os.environ.get("AGENT_SYNC_READ_ONLY") != "1":
             cache["healthy"] = not sync.issues and not sync.changes
             cache["fingerprint"] = fingerprint(sync)
@@ -957,7 +989,7 @@ def hook(args):
         return 0
     except (ConfigError, OSError, ValueError, KeyError, TypeError) as exc:
         print(json.dumps({"hookSpecificOutput": {"hookEventName": event,
-              "additionalContext": f"agent-sync-config could not verify configuration ({type(exc).__name__}). Run agent-sync-config check and resolve it before unrelated work."}}))
+              "additionalContext": f"agent-sync-config could not verify configuration ({type(exc).__name__}). Run agent-sync-config check --scope {scope} and resolve it before unrelated work."}}))
         return 0
 
 
@@ -965,33 +997,71 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", nargs="?", choices=("sync", "check", "hook"), default="sync")
     parser.add_argument("--version", action="version", version=VERSION)
-    parser.add_argument("--project", type=Path, default=Path.cwd())
+    parser.add_argument("--scope", choices=("project", "global"), action="append", help="Select project or global resources exclusively")
+    parser.add_argument("--project", type=Path, help="Project directory (default: current directory); project scope only")
     parser.add_argument("--home", type=Path, default=Path.home(), help="Home override for isolated tests")
-    parser.add_argument("--personal-root", type=Path)
-    parser.add_argument("--project-only", action="store_true", help="Skip personal configuration and machine integration")
+    parser.add_argument("--personal-root", type=Path, help="Personal source directory; global scope only")
+    parser.add_argument("--project-only", action="store_true", help="Alias for --scope project")
     parser.add_argument("--read-only", action="store_true", help="Same behavior as check")
-    parser.add_argument("--json", action="store_true", help="Emit a machine-readable report")
+    parser.add_argument("--json", action="store_true", help="Emit a machine-readable report without interactive prompts")
     parser.add_argument("--provider", choices=("codex", "claude"), default="codex")
-    parser.add_argument("--import-skill", type=Path, help="Explicitly adopt a self-contained skill directory")
-    parser.add_argument("--import-mcp", type=Path, help="Explicitly adopt a Claude-format mcpServers JSON file")
+    parser.add_argument("--import-skill", type=Path, help="Adopt a self-contained skill into the selected scope")
+    parser.add_argument("--import-mcp", type=Path, help="Adopt Claude-format mcpServers into the selected scope")
     args = parser.parse_args(argv)
-    if args.action == "hook":
-        return hook(args)
+    scope, root, selection_required = args.scope[-1] if args.scope else None, None, False
     apply = args.action != "check" and not args.read_only
     try:
-        home, root = args.home.expanduser().resolve(), root_for(args.project)
-        def run():
-            return Sync(home, root, apply, args.personal_root, args.project_only).run(args.import_skill, args.import_mcp)
+        if args.scope and len(set(args.scope)) > 1:
+            raise ConfigError("Contradictory --scope values; choose project or global")
+        if args.project_only:
+            if scope == "global":
+                raise ConfigError("--project-only contradicts --scope global")
+            scope = "project"
+        if scope == "global" and args.project is not None:
+            raise ConfigError("--project cannot be used with --scope global")
+        if args.personal_root and scope != "global":
+            raise ConfigError("--personal-root requires --scope global")
+        if args.action == "hook":
+            args.scope = scope
+            return hook(args)
+        home = args.home.expanduser().resolve()
+        if scope != "global":
+            root = root_for(args.project or Path.cwd())
+        if scope is None:
+            if not apply or project_config_exists(root):
+                scope = "project"
+            elif args.json or not sys.stdin.isatty() or not sys.stdout.isatty():
+                selection_required = True
+                raise ConfigError("Scope selection required: choose --scope project to initialize this project, or --scope global to synchronize personal resources")
+            else:
+                print("No project agent configuration found.\n1. Initialize this project\n2. Synchronize global configuration\nq. Cancel")
+                try:
+                    choice = input("Choose a scope [1/2/q]: ").strip().lower()
+                except (EOFError, KeyboardInterrupt):
+                    choice = "q"
+                if choice in ("", "q", "cancel"):
+                    print("Cancelled; no changes made.")
+                    return 0
+                scope = {"1": "project", "project": "project", "2": "global", "global": "global"}.get(choice)
+                if scope is None:
+                    raise ConfigError("Choose project or global scope; no changes made")
+                if scope == "global" and args.project is not None:
+                    raise ConfigError("Global scope does not accept --project; rerun with --scope global")
+        if scope == "global":
+            root = None
+        # Validate target/manifest before creating runtime state or acquiring a lock.
+        operation = Sync(home, root, apply, args.personal_root, scope=scope)
         if apply:
             with lock(home):
-                result = run()
+                result = operation.run(args.import_skill, args.import_mcp)
         else:
-            result = run()
-        report = {"version": VERSION, "project": str(root), "read_only": not apply,
-                  "changes": result.changes, "issues": result.issues, "notes": result.notes}
+            result = operation.run(args.import_skill, args.import_mcp)
+        report = {"version": VERSION, "scope": scope, "project": str(root) if root else None,
+                  "read_only": not apply, "changes": result.changes, "issues": result.issues, "notes": result.notes}
         if args.json:
             print(json_text(report), end="")
         else:
+            print(f"Scope: {scope}" + (f" ({root})" if root else ""))
             for kind, entries in (("CONFLICT", result.issues), ("CHANGE" if apply else "DRIFT", result.changes), ("NOTE", result.notes)):
                 for message in entries:
                     print(f"{kind}: {message}")
@@ -1002,7 +1072,7 @@ def main(argv=None):
         # Never print configuration contents or resolved environment values on error.
         message = str(exc) if isinstance(exc, ConfigError) else type(exc).__name__
         if args.json:
-            print(json_text({"error": message}), end="")
+            print(json_text({"error": message, "scope": scope, "selection_required": selection_required}), end="")
         else:
             print(f"ERROR: {message}", file=sys.stderr)
         return 2
