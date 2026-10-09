@@ -17,6 +17,26 @@ Use Python 3.9+ on macOS/Linux. The shipped skill is in
 - For documentation-only edits, check the diff and relevant commands/links;
   successful CI on the final commit is required before publishing a release.
 
+## Compatibility and maintained context
+
+- Read [docs/compatibility.md](docs/compatibility.md) when changing provider
+  integrations and before releases. Review targeted official Codex/Claude specs;
+  ordinary user sync must remain offline. Record review date/client versions,
+  changed discovery or loading behavior, and actual verification evidence there.
+- Compare native directories, instructions/rules, skills/commands, subagents, and
+  workflows: paths, scopes/precedence, metadata, arguments, dependency paths,
+  execution controls, loading behavior, and deprecations.
+- For a meaningful spec change, record the difference, reproduce it in a fixture,
+  then make the smallest faithful implementation change or document the limitation.
+  Update focused tests. Keep concise decisions and rationale, not chat transcripts
+  or a second project instruction source.
+- Prefer established shared standards, then existing files, then faithful native
+  adapters. Keep unsupported runtime/permission behavior explicit. Do not invent
+  `.agents/rules`, `.agents/agents`, hooks, workflow runtimes, state infrastructure,
+  dependencies, or new configuration roots to simulate parity.
+- Use focused tests while editing; run the full suite once after the implementation
+  settles. Separate native discovery/loading evidence from model compliance.
+
 ## Commits and pushes
 
 - Commit, push, tag, and publish only when requested or already authorized in the

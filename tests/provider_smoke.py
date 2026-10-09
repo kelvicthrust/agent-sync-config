@@ -60,7 +60,7 @@ def codex_discovery(binary, env, repo, global_installed=True):
         raise AssertionError(f"Codex did not respond to {method}")
 
     try:
-        request(1, "initialize", {"clientInfo": {"name": "agent-sync-smoke", "version": "0.5.0"},
+        request(1, "initialize", {"clientInfo": {"name": "agent-sync-smoke", "version": "fixture"},
                                   "capabilities": {"experimentalApi": True}})
         send({"method": "initialized", "params": {}})
         skills = request(2, "skills/list", {"cwds": [str(repo)], "forceReload": True})
@@ -68,6 +68,7 @@ def codex_discovery(binary, env, repo, global_installed=True):
         assert sum(skill["name"] == "agent-sync-config" and skill["enabled"] for skill in entries) == int(global_installed), skills
         assert sum(skill["name"] == "review-code" and skill["enabled"] for skill in entries) == 1, skills
         assert not any(entry["errors"] for entry in skills["data"]), skills
+        assert sum(skill["name"] == "command-review" and skill["enabled"] for skill in entries) == 1, skills
         assert sum(skill["name"] == "global-review" and skill["enabled"] for skill in entries) == 1, skills
         if not global_installed:
             assert not any(skill["name"] == "agent-sync-config" and str(skill.get("path", "")).startswith(env["HOME"]) for skill in entries), skills
@@ -106,6 +107,8 @@ def main():
         for key in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "OPENAI_API_KEY", "GITHUB_TOKEN", "GH_TOKEN", "CLAUDE_CONFIG_DIR", "XDG_STATE_HOME"):
             env.pop(key, None)
         run(["git", "init", "-q", str(repo)], env, repo)
+        commands = repo / ".claude/commands"; commands.mkdir(parents=True)
+        (commands / "command-review.md").write_text("Review a fixture command.\n")
         folder = repo / ".agents/skills/review-code"; folder.mkdir(parents=True)
         (folder / "SKILL.md").write_text("---\nname: review-code\ndescription: Review a fixture change.\n---\nReview the code.\n")
         (repo / ".mcp.json").write_text(json.dumps({"mcpServers": {

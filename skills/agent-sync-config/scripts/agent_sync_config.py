@@ -14,8 +14,10 @@ import sys
 import tempfile
 
 sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import claude_resources
 
-VERSION = "0.5.1"
+VERSION = "0.6.0"
 NAME = "agent-sync-config"
 BEGIN = "<!-- agent-sync-config:start -->"
 END = "<!-- agent-sync-config:end -->"
@@ -290,6 +292,7 @@ class Sync:
         self.home, self.root, self.apply, self.scope = home, root, apply, scope
         self.base = home if scope == "global" else root
         self.issues, self.changes, self.notes = [], [], []
+        self.resources, self.references = [], []
         self.edits = []
         self.observed = {}
         if scope == "project" and (root == home or exists(root / ".agent-sync.json") or any(root.is_relative_to(home / name)
@@ -394,7 +397,8 @@ class Sync:
             if claude.is_file() and agents.is_file() and not imported_wrapper and claude.read_text() != text:
                 self.issue(f"Personal instructions differ (preserved): {agents}, {claude}")
                 return
-            self.write(agents, text)
+            self.adapter.record(claude, "shared-native", "Native global instructions share one source", agents)
+            self.write(agents, claude_resources.add_references(text, self.references))
             if not imported_wrapper:
                 self.link(claude, agents, comparison=agents if agents.exists() else claude)
             if exists(self.home / ".codex/AGENTS.override.md"):
@@ -428,11 +432,13 @@ class Sync:
         text = text if text is not None else candidates[0][1] if candidates else "# Project instructions\n\nAdd project conventions and build/test commands here.\n"
         before = len(self.issues)
         for path, content, _ in candidates:
-            if strip_guidance(content) != strip_guidance(text):
+            if strip_guidance(claude_resources.strip_references(content)) != strip_guidance(claude_resources.strip_references(text)):
                 self.issue(f"Instructions differ from AGENTS.md (preserved): {path}")
         if len(self.issues) != before:
             return
-        self.write(agents, add_guidance(text))
+        for path, _, _ in candidates:
+            self.adapter.record(path, "shared-native", "Compatible Claude instructions adopted; native import wrapper shares AGENTS.md", agents)
+        self.write(agents, claude_resources.add_references(add_guidance(text), self.references))
         claude = self.root / "CLAUDE.md"
         if not exists(claude) or (not claude.is_symlink() and claude.read_text().strip() == "@AGENTS.md"):
             self.write(claude, "@AGENTS.md\n")
@@ -459,8 +465,12 @@ class Sync:
                 if source.is_symlink():
                     self.issue(f"Externally linked shared skill (preserved): {source}; explicitly reconcile its source")
                     continue
+                if (source / "SKILL.md").is_symlink():
+                    self.issue(f"Externally linked shared skill instructions (preserved): {source / 'SKILL.md'}")
+                    continue
                 self.observe(source)
                 sources[source.name] = source
+                self.adapter.record(source, "shared-native", "Agent Skill shared through native discovery", provider / source.name)
         if imported:
             source = imported.expanduser().resolve()
             if source.name == NAME:
@@ -487,6 +497,10 @@ class Sync:
                 if exists(target) or item.is_symlink():
                     self.issue(f"External skill link needs explicit reconciliation: {item}")
                     continue
+                limitation = claude_resources.skill_limitation((item / "SKILL.md").read_text())
+                if limitation:
+                    self.adapter.reference(item / "SKILL.md", "Skill", limitation)
+                    continue
                 try:
                     portable_skill(item)
                 except ConfigError as exc:
@@ -495,6 +509,7 @@ class Sync:
                 self.observe(item)
                 self.edit("move", target, item, f"Adopt skill: {item} -> {target}")
                 sources[item.name] = item
+                self.adapter.record(item, "shared-native", "Portable Agent Skill adopted with its supporting files", target)
         for name, comparison in sources.items():
             target = provider / name
             # Adoption moves this ordinary directory first, then installs its reference.
@@ -606,8 +621,10 @@ class Sync:
             portable_skill(source)
         self.legacy()
         self.mcp(mcp_source, imported_mcp)  # Parse native formats before planning instruction/skill edits.
-        self.instructions()
+        self.adapter = claude_resources.Resources(self, ConfigError, exists, toml_module)
         self.skills(imported_skill)
+        self.references = self.adapter.run()
+        self.instructions()
         if self.apply:
             self.commit()
         return self
@@ -633,6 +650,11 @@ class Sync:
                 value.rename(path)
             elif kind == "copy":
                 shutil.copytree(value, path)
+            elif kind == "retire-command":
+                replacement, entry, content, original = value
+                if path.is_symlink() or path.read_bytes() != original or replacement.read_text() != content or not entry.is_symlink() or entry.resolve() != replacement.parent.resolve():
+                    raise ConfigError(f"Command replacement could not be verified; original preserved: {path}")
+                path.unlink()
             else:
                 if path.is_dir() and not path.is_symlink():
                     shutil.rmtree(path)
@@ -644,7 +666,7 @@ class Sync:
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", nargs="?", choices=("sync", "check", "hook", "remove-skill", "uninstall"), default="sync",
-                        help="sync or check native sharing; hook is a retired no-op")
+                        help="sync or check native sharing and Claude resource adaptations; hook is a retired no-op")
     parser.add_argument("skill_name", nargs="?", help=argparse.SUPPRESS)
     parser.add_argument("--version", action="version", version=VERSION)
     parser.add_argument("--scope", choices=("project", "global"), action="append", help="Select project or global resources exclusively")
@@ -710,7 +732,7 @@ def main(argv=None):
             root = None
         result = Sync(home, root, apply, scope).run(args.import_skill, args.import_mcp, args.mcp_source)
         report = {"version": VERSION, "scope": scope, "project": str(root) if root else None,
-                  "read_only": not apply, "changes": result.changes, "issues": result.issues, "notes": result.notes}
+                  "read_only": not apply, "changes": result.changes, "issues": result.issues, "notes": result.notes, "resources": result.resources}
         if args.json:
             print(json_text(report), end="")
         else:
@@ -718,6 +740,8 @@ def main(argv=None):
             for kind, entries in (("CONFLICT", result.issues), ("CHANGE" if apply else "DRIFT", result.changes), ("NOTE", result.notes)):
                 for message in entries:
                     print(f"{kind}: {message}")
+            for resource in result.resources:
+                print(f"RESOURCE [{resource['disposition']}]: {resource['source']}: {resource['compatibility']}")
             if not result.issues and not result.changes:
                 print("Configuration is synchronized.")
         return 1 if result.issues or (not apply and result.changes and not args.dry_run) else 0

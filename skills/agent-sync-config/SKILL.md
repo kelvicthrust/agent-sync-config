@@ -1,6 +1,6 @@
 ---
 name: agent-sync-config
-description: Set up or check shared native instructions, skills, context references, and MCP configuration for Codex and Claude Code in a project or explicitly selected global scope.
+description: Set up or check shared native instructions, skills, context references, compatible Claude commands and agents, and MCP configuration for Codex and Claude Code in a project or explicitly selected global scope.
 ---
 
 # Agent Sync Config
@@ -46,7 +46,8 @@ python3 <skill-directory>/scripts/agent_sync_config.py check --scope global
 ```
 
 Unscoped check audits project scope. `--dry-run` previews changes without writes.
-Reports name the scope and paths; global reports have no project target. Exit
+Reports inventory resources with source/destination, disposition, and compatibility;
+name the scope and paths; global reports have no project target. Exit
 codes are 0 for success, 1 for conflicts/check drift, and 2 for invalid input,
 scope selection, or filesystem failure. Read the report before claiming success.
 
@@ -60,6 +61,41 @@ Instruction and skill edits are shared through references immediately. Explicit
 sync adopts compatible new ordinary skills or repairs references. Preserve
 conflicting files, external dependencies, native overrides, system skills,
 provider-managed skills, plugin settings, and unrelated hooks.
+
+## Claude-first resources
+
+Ordinary sync performs supported sharing and adaptation automatically. Do not add
+`convert`, `--reference-claude`, replacement flags, new state, or custom roots.
+
+- Portable skills move with supporting files to `.agents/skills` and receive Claude
+  links. Simple instruction-only commands become valid shared skills; the legacy
+  command is removed only after its replacement and Claude link are verified.
+- Commands with arguments, shell preprocessing, execution controls, plugin
+  variables, nested names, or unsafe relocation dependencies remain reference-only.
+- Simple Claude agents retain their originals and get native `.codex/agents/*.toml`
+  counterparts. Only flat name/description and optional model: inherit are adapted.
+  Complex metadata, unknown fields, execution controls, dependencies, built-in
+  name collisions, and differing existing definitions require explicit review.
+- Claude rules, workflows, and output styles stay in `.claude`. Generated guidance
+  in shared instructions tells Codex when to consult them, retaining rule conditions.
+  These are content references, not activation of Claude loaders or execution controls.
+  Workflow scripts are never run. Unsupported permissions must never be weakened.
+- Settings, hooks, plugins, memory, and credentials remain provider-specific.
+  Do not reference them as portable instructions or emulate their controls.
+
+Use the report's `resources` entries to explain shared native behavior, native
+adaptation, and content references with limitations. Informational limitations do
+not fail sync; conflicts and unresolved adaptations return 1. If either adapted
+agent definition changes, report both paths and ask which source to keep; never
+infer ownership or which edit is newer. Reconcile only with explicit authorization.
+Do not claim that filesystem conversion proves model compliance. Native agent
+support depends on the client's version and existing controls.
+
+Do not invent `.agents/rules`, `.agents/agents`, a workflow runtime, or copy this
+skill into a target project. Project references stay repository-relative; global
+references stay within the explicit personal scope. Ordinary sync remains offline.
+
+## MCP
 
 MCP uses native .mcp.json and .codex/config.toml in projects, or ~/.claude.json
 and ~/.codex/config.toml globally. No neutral MCP file or historical baseline is

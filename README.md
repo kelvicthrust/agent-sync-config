@@ -2,8 +2,8 @@
 
 [![skills.sh](https://skills.sh/b/kelvicthrust/agent-sync-config)](https://skills.sh/kelvicthrust/agent-sync-config)
 
-Share instructions, skills, and context between Codex and Claude Code through
-native files and links. Run the tool explicitly to set up a project, synchronize
+Share instructions, skills, context, and compatible Claude resources between
+Codex and Claude Code through native files and links. Run the tool explicitly to set up a project, synchronize
 personal configuration, or check references. Existing conflicting content is
 preserved.
 
@@ -57,7 +57,9 @@ global configuration. Choose project initialization, or request it explicitly.
 
 **Existing project:** invoke the same skill. Existing local agent configuration
 selects project scope; compatible instructions and ordinary skills are shared
-locally. Conflicts are preserved and reported. Global installation never causes
+locally. Simple Claude commands become shared skills, simple agents get native
+Codex definitions, and useful remaining Claude resources receive reading guidance.
+Conflicts are preserved and reported. Global installation never causes
 project execution to synchronize your personal configuration.
 
 From a checkout:
@@ -100,6 +102,7 @@ optional; it is never a prerequisite for project setup.
 | Skills | `.agents/skills/<name>` | `~/.agents/skills/<name>` |
 | Claude skill references | `.claude/skills/<name>` | `~/.claude/skills/<name>` |
 | Context | Existing documents referenced from AGENTS.md | Existing documents referenced from personal instructions |
+| Adapted agents | `.codex/agents/<name>.toml`; originals stay in `.claude/agents` | `~/.codex/agents/<name>.toml`; originals stay in `~/.claude/agents` |
 | MCP | `.mcp.json`, `.codex/config.toml` | `~/.claude.json`, `~/.codex/config.toml` |
 
 A fresh project without skills or MCP needs only:
@@ -126,9 +129,71 @@ see the same files through references. Add links to existing context documents,
 for example `docs/architecture.md`, in the instructions; the tool does not create
 a separate context store or automatically inject every referenced document.
 
-Run sync to adopt a new compatible provider-only skill or repair references.
+Run sync to adopt new compatible resources or repair references. Agent and MCP
+formats differ, so edits to them require explicit sync; differing definitions
+require source selection rather than automatic overwrites.
 No background synchronization runs. New client sessions load instructions;
 refresh behavior in an already-running client remains provider-specific.
+
+## Starting from a Claude project
+
+Run the same sync command. There is no conversion command or extra opt-in flag.
+It inventories the selected scope's `.claude` directory and applies the supported
+changes while preserving conflicts and unsupported resources.
+
+| Resource | Result |
+| --- | --- |
+| Portable skills | One source in `.agents/skills`, with relative Claude discovery links. Supporting files move with the skill. |
+| Simple commands | Instruction-only `.claude/commands/<name>.md` becomes `.agents/skills/<name>/SKILL.md`. The original command is removed only after the shared skill and Claude link are verified. |
+| Simple agents | The original `.claude/agents/<name>.md` stays in place; a native `.codex/agents/<name>.toml` preserves its name, description, and instruction body. |
+| Rules | Originals remain under `.claude/rules`. A labeled section in shared instructions tells Codex which files to consult and preserves path conditions. |
+| Workflows and output styles | Originals remain in Claude. Shared instructions reference useful content when requested and explain the native behavior that is unavailable. |
+| Settings, hooks, plugins, memory, credentials | Remain provider-specific. They are neither copied into shared instructions nor emulated. |
+
+Commands qualify when they contain only instructions and optional flat
+`name`/`description` metadata. The name must match the legacy filename so Claude
+invocation stays the same. A missing name comes from the filename; a missing
+description comes from the name. Argument substitution, shell preprocessing,
+forking, tool permissions, model selection, plugin variables, nested command names,
+and paths that cannot be retained faithfully stay reference-only. Existing
+conflicting skills and redirected links are preserved.
+
+Agents qualify with flat `name`/`description` metadata and optional `model: inherit`.
+Complex YAML, unknown fields, explicit model choices, tool restrictions, permissions,
+memory, hooks, isolation, and other execution controls require review. Built-in
+Codex agent names and existing differing definitions are conflicts. The tool does
+not enable agents or change native trust settings. Compatible native clients are
+required; consult [compatibility and specification reviews](docs/compatibility.md).
+
+**Sharing, adaptation, and references have different guarantees.** Shared skills
+use native discovery and expose edits through the same files. Adapted agents are
+separate native definitions: after either file changes, sync reports both paths
+for explicit reconciliation. Content references tell Codex when to read a file;
+they do not reproduce Claude's conditional loader, output-style selection,
+permissions, or orchestration. Workflow scripts can be inspected for their steps;
+the synchronizer never runs them or creates a substitute runtime.
+
+For example, a Claude-first repository can become:
+
+```text
+repo/
+├── AGENTS.md                    # shared instructions + conditional references
+├── CLAUDE.md                    # @AGENTS.md
+├── .agents/skills/review/SKILL.md
+├── .claude/
+│   ├── skills/review -> ../../.agents/skills/review
+│   ├── agents/reviewer.md       # retained original
+│   ├── rules/api.md             # retained, path conditions referenced
+│   └── workflows/review.js      # retained, inspect only
+└── .codex/agents/reviewer.toml   # native adaptation
+```
+
+Project references are repository-relative and survive relocation. Global
+references use only the selected home. Nothing is borrowed from another scope.
+There are no invented `.agents/rules`, `.agents/agents`, or workflow runtimes.
+Repeat sync regenerates only its labeled reference section, preserving your
+other instruction content. Removing a referenced resource removes its generated
+reference on the next sync.
 
 ## Existing content and scope rules
 
@@ -197,7 +262,11 @@ required. See [MCP compatibility](docs/mcp.md).
 
 Checks and dry runs write nothing, including runtime state. Exit codes:
 `0` success, `1` conflicts or check drift, `2` invalid input, scope selection, or
-filesystem failure. Reports include the resolved scope and affected paths.
+filesystem failure. Reports include the resolved scope and affected paths. JSON adds a `resources`
+list with `source`, optional `destination`, `disposition`, and `compatibility`:
+`shared-native`, `native-adaptation`, `content-reference`, `provider-specific`,
+`preserved`, or `conflict`. Informational limitations alone do not fail sync;
+conflicts and unresolved agent adaptations return `1`.
 Successful repeat sync makes no further changes.
 
 There is no removal history. Sync can repair a provider link you deliberately

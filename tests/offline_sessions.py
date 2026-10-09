@@ -84,7 +84,7 @@ class MockAPI(BaseHTTPRequestHandler):
         self.event("response.completed", {"type": "response.completed", "response": response})
 
 
-def session(command, env, repo):
+def session(command, env, repo, setup_skill=True):
     start = len(MockAPI.requests)
     result = subprocess.run(command, env=env, cwd=repo, capture_output=True, text=True, timeout=30)
     if result.returncode or "fixture-success" not in result.stdout:
@@ -92,7 +92,8 @@ def session(command, env, repo):
     sent = MockAPI.requests[start:]
     assert sent, "Native session did not use the local mock API"
     serialized = json.dumps(sent)
-    assert "bundled deterministic tool" in serialized, "The invoked setup skill body was not loaded"
+    if setup_skill:
+        assert "bundled deterministic tool" in serialized, "The invoked setup skill body was not loaded"
     return sent, result.stdout
 
 
@@ -120,8 +121,16 @@ def main():
                 env.pop(key, None)
             subprocess.run(["git", "init", "-q", str(repo)], check=True)
             (repo / "AGENTS.md").write_text("PROJECT_INSTRUCTIONS_SENTINEL\n")
+            commands = repo / ".claude/commands"; commands.mkdir(parents=True)
+            (commands / "command-review.md").write_text("MIGRATED_COMMAND_BODY_SENTINEL\nReview changes.\n")
+            agents = repo / ".claude/agents"; agents.mkdir(parents=True)
+            (agents / "fixture-reviewer.md").write_text("---\nname: fixture-reviewer\ndescription: NATIVE_REVIEWER_DISCOVERY_SENTINEL\n---\nReview changes.\n")
+            rules = repo / ".claude/rules"; rules.mkdir(parents=True)
+            (rules / "fixture-rule.md").write_text('---\npaths: ["src/**"]\n---\nRULE_BODY_NOT_AUTOMATICALLY_INJECTED\n')
             (home / ".codex").mkdir()
             (home / ".codex/AGENTS.md").write_text("PERSONAL_INSTRUCTIONS_SENTINEL\n")
+            personal_agents = home / ".claude/agents"; personal_agents.mkdir(parents=True)
+            (personal_agents / "personal-reviewer.md").write_text("---\nname: personal-reviewer\ndescription: PERSONAL_REVIEWER_DISCOVERY_SENTINEL\n---\nReview personal changes.\n")
             installed = home / ".agents/skills/agent-sync-config"
             installed.parent.mkdir(parents=True)
             shutil.copytree(ROOT / "skills/agent-sync-config", installed, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
@@ -141,6 +150,7 @@ def main():
                               f'[model_providers.fixture]\nname="Fixture"\nbase_url="{endpoint}/v1"\n'
                               'wire_api="responses"\nenv_key="AGENT_SYNC_FIXTURE_KEY"\n'
                               'requires_openai_auth=false\nsupports_websockets=false\n'
+                              '[features]\nmulti_agent=true\n'
                               f'[projects.{json.dumps(str(repo))}]\ntrust_level="trusted"\n')
             (repo / ".claude/settings.local.json").write_text(json.dumps({"enabledMcpjsonServers": ["local-probe"]}))
             link = repo / ".claude/skills/review-code"
@@ -152,6 +162,10 @@ def main():
                 serialized = json.dumps(sent)
                 assert all(token in serialized for token in ("PROJECT_INSTRUCTIONS_SENTINEL", "PERSONAL_INSTRUCTIONS_SENTINEL"))
                 assert "fixture_echo" in serialized, "Codex did not connect to the local MCP fixture"
+                assert "fixture-rule.md" in serialized and "RULE_BODY_NOT_AUTOMATICALLY_INJECTED" not in serialized
+                assert all(marker in serialized for marker in ("NATIVE_REVIEWER_DISCOVERY_SENTINEL", "PERSONAL_REVIEWER_DISCOVERY_SENTINEL")), "Codex did not load the adapted agent catalog"
+                migrated, _ = session([*command, f"[$command-review]({repo / '.agents/skills/command-review/SKILL.md'})"], env, repo, setup_skill=False)
+                assert "MIGRATED_COMMAND_BODY_SENTINEL" in json.dumps(migrated), "Codex did not load the migrated command skill"
                 assert not link.exists(), "A Codex read-only session repaired managed resources"
                 assert not cache_dir.exists(), "A session created synchronizer hook metadata"
                 with (repo / "AGENTS.md").open("a") as stream:
@@ -159,7 +173,7 @@ def main():
                 resumed, _ = session([*command, "resume", "--last", f"[$agent-sync-config]({home / '.agents/skills/agent-sync-config/SKILL.md'}) check"], env, repo)
                 assert "agent-sync-config" in json.dumps(resumed)
                 assert not link.exists()
-                report["codex"] = "instructions, globally installed skill invocation, MCP connection, read-only behavior, and resume passed"
+                report["codex"] = "instructions, installed and migrated skill loading, project/global adapted agent catalog, conditional references, MCP, read-only behavior, and resume passed"
             if args.claude:
                 if link.is_symlink():
                     link.unlink()
@@ -168,6 +182,11 @@ def main():
                 serialized = json.dumps(sent)
                 assert all(token in serialized for token in ("PROJECT_INSTRUCTIONS_SENTINEL", "PERSONAL_INSTRUCTIONS_SENTINEL"))
                 assert "fixture_echo" in serialized, "Claude did not connect to the local MCP fixture"
+                assert "fixture-rule.md" in serialized and "RULE_BODY_NOT_AUTOMATICALLY_INJECTED" not in serialized
+                migrated, migrated_output = session([*command, "--permission-mode", "plan", "/command-review"], env, repo, setup_skill=False)
+                assert "MIGRATED_COMMAND_BODY_SENTINEL" in json.dumps(migrated), "Claude did not load the migrated command skill"
+                initialization = next(json.loads(line) for line in migrated_output.splitlines() if json.loads(line).get("type") == "system" and json.loads(line).get("subtype") == "init")
+                assert "fixture-reviewer" in initialization.get("agents", []), "Claude no longer discovers the original agent"
                 assert not link.exists(), "A Claude planning session repaired managed resources"
                 result = next(json.loads(line) for line in output.splitlines() if json.loads(line).get("type") == "result")
                 with (repo / "AGENTS.md").open("a") as stream:
@@ -180,7 +199,7 @@ def main():
                 assert not link.exists(), "A prompt repaired a link without explicit sync"
                 subprocess.run([sys.executable, str(SCRIPT), "--scope", "project", "--project", str(repo), "--home", str(home)], env=env, check=True, stdout=subprocess.DEVNULL)
                 assert link.is_symlink()
-                report["claude"] = "instructions, globally installed skill invocation, MCP connection, planning behavior, resume, and explicit repair passed"
+                report["claude"] = "instructions, installed and migrated skill loading, retained native agents, conditional references, MCP, planning behavior, resume, and explicit repair passed"
     finally:
         server.shutdown(); server.server_close()
     report["inference"] = "local protocol stub; no real model or credentials used"
