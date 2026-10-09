@@ -1,8 +1,6 @@
-"""Exercise native loaders/hooks with a localhost API stub, never a real model.
+"""Exercise native instructions, installed skills and MCP with a local API stub.
 
-This script needs installed provider binaries and localhost socket access. It
-creates all config in temporary homes. Its Codex hook-trust bypass applies only
-to the scoped fixture hooks authored/generated here; production setup never uses it.
+All configuration is disposable; no real model or credentials are used.
 """
 import argparse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -144,19 +142,19 @@ def main():
             cache_dir = home / ".local/state/agent-sync-config/cache"
             if args.codex:
                 link.unlink()
-                command = [args.codex, "exec", "--dangerously-bypass-hook-trust", "--sandbox", "read-only", "--json"]
-                sent, _ = session([*command, f"[$agent-sync-config]({repo / '.agents/skills/agent-sync-config/SKILL.md'}) check"], env, repo)
+                command = [args.codex, "exec", "--sandbox", "read-only", "--json"]
+                sent, _ = session([*command, f"[$agent-sync-config]({home / '.agents/skills/agent-sync-config/SKILL.md'}) check"], env, repo)
                 serialized = json.dumps(sent)
                 assert all(token in serialized for token in ("PROJECT_INSTRUCTIONS_SENTINEL", "PERSONAL_INSTRUCTIONS_SENTINEL"))
                 assert "fixture_echo" in serialized, "Codex did not connect to the local MCP fixture"
                 assert not link.exists(), "A Codex read-only session repaired managed resources"
-                assert any(json.loads(path.read_text()).get("sessions") for path in cache_dir.glob("*.json")), "Native hooks did not cache session metadata"
+                assert not cache_dir.exists(), "A session created synchronizer hook metadata"
                 with (repo / "AGENTS.md").open("a") as stream:
                     stream.write("\nUPDATED_INSTRUCTIONS_SENTINEL\n")
-                resumed, _ = session([*command, "resume", "--last", f"[$agent-sync-config]({repo / '.agents/skills/agent-sync-config/SKILL.md'}) check"], env, repo)
-                assert "Read AGENTS.md" in json.dumps(resumed), "Resumed session did not receive the instruction refresh cue"
+                resumed, _ = session([*command, "resume", "--last", f"[$agent-sync-config]({home / '.agents/skills/agent-sync-config/SKILL.md'}) check"], env, repo)
+                assert "agent-sync-config" in json.dumps(resumed)
                 assert not link.exists()
-                report["codex"] = "instructions, skill invocation, native hooks, MCP connection, read-only behavior, and resume refresh passed"
+                report["codex"] = "instructions, globally installed skill invocation, MCP connection, read-only behavior, and resume passed"
             if args.claude:
                 if link.is_symlink():
                     link.unlink()
@@ -171,11 +169,13 @@ def main():
                     stream.write("\nCLAUDE_UPDATED_INSTRUCTIONS_SENTINEL\n")
                 resumed, _ = session([*command, "--resume", result["session_id"], "--permission-mode", "plan",
                                       "/agent-sync-config check"], env, repo)
-                assert "Read AGENTS.md" in json.dumps(resumed)
+                assert "agent-sync-config" in json.dumps(resumed)
                 assert not link.exists()
                 session([*command, "--permission-mode", "default", "/agent-sync-config check"], env, repo)
-                assert link.is_symlink(), "A writable Claude prompt did not repair the missing link"
-                report["claude"] = "instructions, skill invocation, native hooks, MCP connection, planning behavior, resume refresh, and safe repair passed"
+                assert not link.exists(), "A prompt repaired a link without explicit sync"
+                subprocess.run([sys.executable, str(SCRIPT), "--scope", "project", "--project", str(repo), "--home", str(home)], env=env, check=True, stdout=subprocess.DEVNULL)
+                assert link.is_symlink()
+                report["claude"] = "instructions, globally installed skill invocation, MCP connection, planning behavior, resume, and explicit repair passed"
     finally:
         server.shutdown(); server.server_close()
     report["inference"] = "local protocol stub; no real model or credentials used"

@@ -19,7 +19,7 @@ from contextlib import contextmanager
 
 sys.dont_write_bytecode = True
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 NAME = "agent-sync-config"
 SCHEMA = 1
 SKILL = Path(__file__).resolve().parents[1]
@@ -31,8 +31,8 @@ GUIDANCE = f"""{BEGIN}
 This repository uses agent-sync-config to share instructions, skills, curated
 context, and MCP configuration across Codex and Claude Code.
 
-Use the agent-sync-config skill after changing shared configuration, when hooks
-report drift or conflicts, or when switching clients without an automatic check.
+Use the installed agent-sync-config skill to adopt new resources, repair
+references, reconcile conflicts, or render changed MCP configuration.
 Claude Code: /agent-sync-config. Codex CLI/IDE: $agent-sync-config.
 Codex desktop: select agent-sync-config with @.
 
@@ -41,9 +41,9 @@ require a separate explicit `--scope global` command and do not modify this repo
 For read-only verification, run `agent-sync-config check --scope project`.
 Edit shared instructions here, skills in `.agents/skills/`, context in
 `.agents/context/`, and MCP definitions in `.agents/mcp.json`.
-Project setup packages this skill in `.agents/skills/agent-sync-config/`.
-Preserve conflicting content and reconcile it before syncing. References alone
-do not install skills; automatic checks require enabled, trusted hooks.
+Instruction and skill edits are shared through references immediately.
+The tool stays installed on your machine; this project contains no tool runtime
+or automatic sync hooks. Preserve conflicting content before syncing.
 {END}
 """
 ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -81,7 +81,7 @@ def digest(data: bytes) -> str:
 
 
 def tree_digest(path: Path) -> str:
-    """Used only during explicit adoption/installation, never warm prompt checks."""
+    """Hash owned content during explicit synchronization and cleanup."""
     h = hashlib.sha256()
     for item in sorted(path.rglob("*")):
         if "__pycache__" in item.parts or item.suffix == ".pyc":
@@ -162,34 +162,6 @@ def root_for(path: Path) -> Path:
         if (candidate / ".agents/agent-sync.json").is_file():
             return candidate
     return path
-
-
-def project_hook_command(provider: str) -> str:
-    # The native hook supplies cwd on stdin. Locate the vendored runtime before
-    # loading it, even when invoked from a nested directory or a moved checkout.
-    bootstrap = '''import io,json,os,runpy,sys
-from pathlib import Path
-raw=sys.stdin.read()
-event="UserPromptSubmit"
-try:
-    payload=json.loads(raw)
-    event=payload.get("hook_event_name",event)
-    cwd=Path(payload.get("cwd",os.getcwd())).resolve()
-    candidates=(cwd,*cwd.parents)
-    root=next((p for p in candidates if (p/".git").exists()),None)
-    if root is None:
-        root=next((p for p in candidates if (p/".agents/agent-sync.json").is_file()),cwd)
-    script=root/".agents/skills/agent-sync-config/scripts/agent_sync_config.py"
-    if not script.is_file():
-        raise OSError("Missing project runtime")
-except (OSError,ValueError,TypeError,AttributeError):
-    print(json.dumps({"hookSpecificOutput":{"hookEventName":event,"additionalContext":"agent-sync-config: project hook cannot locate its runtime. Run agent-sync-config --scope project."}}))
-    sys.exit(0)
-sys.stdin=io.StringIO(raw)
-sys.argv=[str(script),"hook","--scope","project","--provider",sys.argv[1]]
-runpy.run_path(str(script),run_name="__main__")
-'''
-    return shlex.join(["python3", "-c", bootstrap, provider])
 
 
 def project_config_exists(root: Path) -> bool:
@@ -334,9 +306,9 @@ def import_server(native: dict, provider: str) -> dict:
 
 class Sync:
     def __init__(self, home: Path, root: Path | None, apply: bool, personal: Path | None = None,
-                 scope: str = "project", hook: bool = False):
+                 scope: str = "project"):
         self.home, self.root, self.apply = home, root, apply
-        self.scope, self.hook = scope, hook
+        self.scope = scope
         self.state_dir = home / ".local/state/agent-sync-config"
         self.registry_path = self.state_dir / "registry.json"
         self.registry = read_json(self.registry_path, {"schema": SCHEMA, "projects": {}})
@@ -479,9 +451,6 @@ class Sync:
         agents = self.root / "AGENTS.md"
         claude = self.root / "CLAUDE.md"
         local_claude = self.root / ".claude/CLAUDE.md"
-        if self.hook and not agents.exists():
-            self.issue("Shared AGENTS.md is missing; reconcile it explicitly rather than recreating instructions in a hook")
-            return
         if agents.is_symlink():
             self.issue(f"Project AGENTS.md is externally linked; reconcile before adoption: {agents}")
             return
@@ -515,11 +484,12 @@ class Sync:
         if exists(self.root / "AGENTS.override.md"):
             self.issue("AGENTS.override.md masks shared root instructions in Codex; reconcile it explicitly")
 
-    def skills(self, canonical: Path, targets: list[Path], records: dict, base: Path, blocked=None):
+    def skills(self, canonical: Path, targets: list[Path], records: dict, base: Path, blocked=None, adoption=()):
         blocked = blocked or set()
         self.mkdir(canonical)
-        for target_dir in targets:
-            self.mkdir(target_dir)
+        for target_dir in [*targets, *adoption]:
+            if target_dir in targets:
+                self.mkdir(target_dir)
             if not target_dir.is_dir() or target_dir.is_symlink():
                 continue
             for item in sorted(target_dir.iterdir()):
@@ -614,9 +584,6 @@ class Sync:
         codex = (self.home if personal else self.root) / ".codex/config.toml"
         claude = self.home / ".claude.json" if personal else self.root / ".mcp.json"
         codex_doc = read_toml(codex)
-        features = plain(codex_doc.get("features", {}))
-        if isinstance(features, dict) and features.get("hooks", features.get("codex_hooks")) is False:
-            self.issue(f"Codex hooks are disabled by configuration (preserved): {codex}")
         return {"codex": (codex, codex_doc, "mcp_servers"),
                 "claude": (claude, read_json(claude, {}), "mcpServers")}
 
@@ -728,52 +695,135 @@ class Sync:
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copytree(source, target)
 
-    def install_hooks(self):
-        global_scope = self.scope == "global"
-        base = self.home if global_scope else self.root
-        records = self.registry if global_scope else self.manifest
-        script = self.personal / "skills/agent-sync-config/scripts/agent_sync_config.py"
-        for provider, path in (("codex", base / ".codex/hooks.json"),
-                               ("claude", base / ".claude/settings.json")):
+    def retired_hook_documents(self, records, base):
+        commands = records.get("hook_commands", {})
+        if not isinstance(commands, dict):
+            raise ConfigError("Invalid recorded hook commands")
+        updates = []
+        for provider, relative in (("codex", ".codex/hooks.json"), ("claude", ".claude/settings.json")):
+            previous = commands.get(provider, [])
+            if not isinstance(previous, list) or any(not isinstance(command, str) for command in previous):
+                raise ConfigError("Invalid recorded hook command")
+            if not previous:
+                continue
+            path = base / relative
+            if not exists(path):
+                continue
+            if path.is_symlink():
+                self.issue(f"Linked hook settings (preserved): {path}")
+                continue
             doc = read_json(path, {})
-            if doc.get("disableAllHooks"):
-                self.issue(f"Hooks disabled by existing settings (preserved): {path}")
-            hooks = doc.setdefault("hooks", {})
+            hooks = doc.get("hooks", {})
             if not isinstance(hooks, dict):
                 raise ConfigError(f"Expected hooks object: {path}")
-            command = (shlex.join([sys.executable, str(script), "hook", "--scope", "global",
-                                  "--provider", provider, "--home", str(self.home)])
-                       if global_scope else project_hook_command(provider))
-            old_commands = records.setdefault("hook_commands", {}).get(provider, [])
-            for event in ("SessionStart", "UserPromptSubmit"):
-                entries = hooks.setdefault(event, [])
-                if not isinstance(entries, list):
-                    raise ConfigError(f"Expected hook list: {path} [{event}]")
-                found = False
-                updated = []
-                for entry in entries:
-                    if not isinstance(entry, dict) or not isinstance(entry.get("hooks"), list):
-                        raise ConfigError(f"Invalid hook group: {path} [{event}]")
-                    remaining = []
-                    for handler in entry["hooks"]:
+            changed = False
+            for event, groups in list(hooks.items()):
+                if not isinstance(groups, list):
+                    raise ConfigError(f"Expected hook groups: {path}")
+                retained = []
+                for group in groups:
+                    if not isinstance(group, dict) or not isinstance(group.get("hooks"), list):
+                        raise ConfigError(f"Invalid hook group: {path}")
+                    handlers = []
+                    removed = False
+                    for handler in group["hooks"]:
                         if not isinstance(handler, dict):
                             raise ConfigError(f"Invalid hook handler: {path}")
-                        if handler.get("command") in old_commands or handler.get("command") == command:
-                            if handler.get("command") == command and not found and handler.get("type") == "command" and not handler.get("async"):
-                                remaining.append(handler)
-                                found = True
-                        else:
-                            remaining.append(handler)
-                    if remaining:
-                        updated.append({**entry, "hooks": remaining})
-                if not found:
-                    updated.append({"hooks": [{"type": "command", "command": command, "timeout": 5}]})
-                hooks[event] = updated
-            self.write(path, json_text(doc), 0o600)
-            records["hook_commands"][provider] = [command]
-        if global_scope:
-            self.registry["global_hooks_audit_only"] = True
-        self.notes.append("Review/trust Codex hook definitions in /hooks. Restart Claude Code after initial hook installation. External policy can disable hooks; file presence does not prove execution.")
+                        command = handler.get("command", "")
+                        if command in previous:
+                            if handler == {"type": "command", "command": command, "timeout": 5} and set(group) == {"hooks"}:
+                                changed = removed = True
+                                continue
+                            self.issue(f"Modified owned hook (preserved): {path} [{event}]")
+                        elif isinstance(command, str) and "agent-sync-config/scripts/agent_sync_config.py" in command and "hook" in command:
+                            self.issue(f"Unrecorded synchronizer hook (preserved): {path} [{event}]")
+                        handlers.append(handler)
+                    if handlers or not removed:
+                        retained.append({**group, "hooks": handlers})
+                if retained:
+                    hooks[event] = retained
+                elif groups:
+                    hooks.pop(event)
+            if changed:
+                if not hooks:
+                    doc.pop("hooks", None)
+                updates.append((path, doc))
+        return updates
+
+    def retire_hooks(self, records, base):
+        if "hook_commands" not in records and "global_hooks_audit_only" not in records:
+            return True
+        before = len(self.issues)
+        updates = self.retired_hook_documents(records, base)
+        if len(self.issues) != before:
+            return False
+        for path, doc in updates:
+            if doc:
+                self.write(path, json_text(doc))
+            else:
+                self.delete_owned(path)
+        self.changed(f"Retire automatic sync hook ownership: {base}")
+        if self.apply:
+            records.pop("hook_commands", None)
+            records.pop("global_hooks_audit_only", None)
+        return True
+
+    def retire_project_runtime(self):
+        package = self.root / ".agents/skills" / NAME
+        owned_digest = self.manifest.get("tool_digest")
+        if not owned_digest:
+            return
+        entries = {key: value for key, value in self.manifest["links"].items() if Path(key).name == NAME}
+        before = len(self.issues)
+        if exists(package) and (package.is_symlink() or not package.is_dir() or
+                                tree_digest(package) != owned_digest or self.private_vcs(package)):
+            self.issue(f"Modified project setup package (preserved): {package}")
+        for key, value in entries.items():
+            target = self.root / key
+            if exists(target) and not (target.is_symlink() and os.readlink(target) == value and target.resolve() == package.resolve()):
+                self.issue(f"Modified setup skill entrypoint (preserved): {target}")
+        self.retired_hook_documents(self.manifest, self.root)  # Preflight before deleting the executable.
+        if len(self.issues) != before:
+            return
+        if not self.retire_hooks(self.manifest, self.root):
+            return
+        for key in entries:
+            self.delete_owned(self.root / key)
+            if self.apply:
+                self.manifest["links"].pop(key, None)
+        self.delete_owned(package)
+        self.changed(f"Retire project runtime ownership: {package}")
+        if self.apply:
+            self.manifest.pop("tool_digest", None)
+
+    def retire_legacy_skills(self, canonical, records, base, state=None, blocked=None):
+        blocked = blocked or set()
+        legacy = base / ".codex/skills"
+        if legacy.is_dir():
+            for item in sorted(legacy.iterdir()):
+                if item.name.startswith(".") or item.name in blocked or not (item / "SKILL.md").is_file():
+                    continue
+                if str(item.relative_to(base)) not in records:
+                    self.notes.append(f"Unowned legacy skill entrypoint preserved; review it to avoid duplicate discovery: {item}")
+        for key, previous in list(records.items()):
+            if str(Path(key).parent) != ".codex/skills" or Path(key).name in blocked:
+                continue
+            name = Path(key).name
+            source = canonical / name
+            supported = base / (".agents/skills" if state is not None else ".claude/skills") / name
+            if not source.is_dir() or not supported.is_dir() or supported.resolve() != source.resolve():
+                self.issue(f"Cannot retire legacy alias without a verified replacement: {base / key}")
+                continue
+            target = base / key
+            if exists(target) and not (target.is_symlink() and os.readlink(target) == previous and target.resolve() == source.resolve()):
+                self.issue(f"Modified legacy skill alias (preserved): {target}")
+                continue
+            self.delete_owned(target)
+            self.changed(f"Retire legacy skill ownership: {target}")
+            if self.apply:
+                records.pop(key, None)
+                if state is not None:
+                    state.get("skills", {}).get(name, {}).get("entrypoints", {}).pop(key, None)
 
     def install_runtime(self, canonical: Path, state: dict):
         target = canonical / NAME
@@ -913,7 +963,7 @@ class Sync:
         for name, record in state.get("skills", {}).items():
             if name in state.get("removed_skills", {}):
                 continue
-            missing = [key for key in record["entrypoints"] if not exists(self.home / key)]
+            missing = [key for key in record["entrypoints"] if str(Path(key).parent) != ".codex/skills" and not exists(self.home / key)]
             source = self.personal / "skills" / name
             if not source.is_dir() or source.is_symlink():
                 missing.append("shared source")
@@ -925,7 +975,7 @@ class Sync:
             if missing:
                 pending[name] = {"kind": "removal", "missing": missing}
         for name in state.get("removed_skills", {}):
-            if any(exists(self.home / directory / name) for directory in (".agents/skills", ".claude/skills", ".codex/skills")):
+            if any(exists(self.home / directory / name) for directory in (".agents/skills", ".claude/skills")):
                 pending[name] = {"kind": "reinstall", "missing": []}
         return pending
 
@@ -949,7 +999,7 @@ class Sync:
                 (self.home / key).is_symlink() and os.readlink(self.home / key) == value
                 for key, value in entries.items())
             record = {**previous, "digest": tree_digest(source) if healthy or not previous else previous["digest"],
-                      "entrypoints": entries}
+                      "entrypoints": {**previous.get("entrypoints", {}), **entries}}
             cli_key, entry = self.cli_entry(doc, source.name)
             if entry is not None and healthy:
                 record["cli"] = {"path": str(path), "key": cli_key, "entry": copy.deepcopy(entry)}
@@ -1015,7 +1065,7 @@ class Sync:
         if not SKILL_NAME.fullmatch(name):
             raise ConfigError("Skill name must use lowercase letters, numbers, and hyphens")
         if name == NAME:
-            raise ConfigError("Use uninstall --scope global to remove agent-sync-config and its hooks")
+            raise ConfigError("Use uninstall --scope global to remove agent-sync-config and its machine integration")
         state = self.personal_state()
         lock_path, lock_doc = self.cli_lock()
         if state.get("detached"):
@@ -1143,7 +1193,14 @@ class Sync:
                     self.issue(f"Changed canonical native skill (preserved): {native}")
             materialize.append((source, native))
             for key in record["entrypoints"]:
-                if key != str(native.relative_to(self.home)):
+                if str(Path(key).parent) == ".codex/skills":
+                    target = self.home / key
+                    if exists(target):
+                        if target.is_symlink() and os.readlink(target) == record["entrypoints"][key] and target.resolve() == source.resolve():
+                            delete.append(target)
+                        else:
+                            self.issue(f"Modified legacy skill alias (preserved): {target}")
+                elif key != str(native.relative_to(self.home)):
                     relink.append((self.home / key, native))
             if purge:
                 if self.private_vcs(source):
@@ -1162,47 +1219,7 @@ class Sync:
                 self.issue(f"Changed terminal wrapper (preserved): {wrapper}")
             else:
                 delete.append(wrapper)
-        hook_docs = []
-        commands = self.registry.get("hook_commands", {})
-        if not isinstance(commands, dict):
-            raise ConfigError("Invalid recorded global hook commands")
-        for provider, relative in (("codex", ".codex/hooks.json"), ("claude", ".claude/settings.json")):
-            path = self.home / relative
-            doc = read_json(path, {})
-            if path.is_symlink():
-                self.issue(f"Linked hook settings (preserved): {path}")
-            hooks = doc.get("hooks", {})
-            if not isinstance(hooks, dict):
-                raise ConfigError(f"Expected hooks object: {path}")
-            previous = commands.get(provider, [])
-            if not isinstance(previous, list) or any(not isinstance(command, str) for command in previous):
-                raise ConfigError("Invalid recorded hook command")
-            changed = False
-            for event, groups in hooks.items():
-                if not isinstance(groups, list):
-                    raise ConfigError(f"Expected hook groups: {path}")
-                remaining_groups = []
-                for group in groups:
-                    if not isinstance(group, dict) or not isinstance(group.get("hooks"), list):
-                        raise ConfigError(f"Invalid hook group: {path}")
-                    remaining = []
-                    group_changed = False
-                    for handler in group["hooks"]:
-                        if not isinstance(handler, dict):
-                            raise ConfigError(f"Invalid hook handler: {path}")
-                        command = handler.get("command", "")
-                        if command in previous and handler.get("type") == "command":
-                            changed = True
-                            group_changed = True
-                        else:
-                            if isinstance(command, str) and str(runtime / "scripts/agent_sync_config.py") in command:
-                                self.issue(f"Modified global runtime hook (preserved): {path} [{event}]")
-                            remaining.append(handler)
-                    if remaining or not group_changed:
-                        remaining_groups.append({**group, "hooks": remaining})
-                hooks[event] = remaining_groups
-            if changed:
-                hook_docs.append((path, doc))
+        hook_docs = self.retired_hook_documents(self.registry, self.home)
         if purge:
             shared = state.get("shared_files", {})
             if not shared and state["links"]:
@@ -1276,7 +1293,10 @@ class Sync:
                     target.unlink()
                 target.symlink_to(desired)
         for path, doc in hook_docs:
-            self.write(path, json_text(doc))
+            if doc:
+                self.write(path, json_text(doc))
+            else:
+                self.delete_owned(path)
         tool_key = owned.get(NAME, {}).get("cli", {}).get("key", NAME)
         if lock_doc is not None and tool_key in lock_doc["skills"] and NAME in owned:
             del lock_doc["skills"][tool_key]
@@ -1353,18 +1373,15 @@ class Sync:
         if NAME not in blocked:
             target = self.install_runtime(canonical, state)
         targets = [self.home / ".agents/skills", self.home / ".claude/skills"]
-        # Adopt legacy Codex skills without touching its .system directory.
         legacy = self.home / ".codex/skills"
-        if legacy.is_dir():
-            targets.append(legacy)
-        self.skills(canonical, targets, state["links"], self.home, blocked)
-        if not self.hook:
-            self.record_skills(state, targets, blocked)
+        self.skills(canonical, targets, state["links"], self.home, blocked, adoption=[legacy] if legacy.is_dir() else [])
+        self.retire_legacy_skills(canonical, state["links"], self.home, state, blocked)
+        self.retire_hooks(self.registry, self.home)
+        self.record_skills(state, targets, blocked)
         self.mcp(self.personal / "mcp.json", state["mcp"], personal=True, imported=imported_mcp)
         if self.apply:
             self.registry["personal_root"] = str(self.personal)
         if NAME not in blocked:
-            self.install_hooks()
             wrapper = self.wrapper(target)
             self.write(self.home / ".local/bin/agent-sync-config", wrapper, 0o755)
             state["wrapper_digest"] = digest(wrapper.encode())
@@ -1384,7 +1401,7 @@ class Sync:
                 if os.environ.get("CLAUDE_CONFIG_DIR"):
                     self.issue("CLAUDE_CONFIG_DIR override is not supported by the global adapter")
             self.personal_setup(imported_skill, imported_mcp)
-            if self.apply and not self.hook:
+            if self.apply:
                 self.write(self.registry_path, json_text(self.registry), 0o600)
             return self
         self.mkdir(self.root / ".agents")
@@ -1395,69 +1412,25 @@ class Sync:
             self.import_skill(imported_skill)
         canonical = self.root / ".agents/skills"
         self.mkdir(canonical)
-        if not self.hook:
-            self.install_runtime(canonical, self.manifest)
-            self.install_hooks()
-        else:
-            if not (canonical / NAME / "scripts/agent_sync_config.py").is_file():
-                self.issue("Project runtime is missing; run agent-sync-config --scope project")
-            if not self.apply:
-                self.install_hooks()  # Audit definitions; native trust changes stay explicit.
+        self.retire_project_runtime()
+        if not self.manifest.get("tool_digest"):
+            self.retire_hooks(self.manifest, self.root)
         targets = [self.root / ".claude/skills"]
-        if (self.root / ".codex/skills").is_dir():
-            targets.append(self.root / ".codex/skills")
-        self.skills(canonical, targets, self.manifest["links"], self.root)
-        for settings in (self.root / ".claude/settings.json", self.root / ".claude/settings.local.json"):
-            if read_json(settings, {}).get("disableAllHooks"):
-                self.issue(f"Claude hooks are disabled by project settings (preserved): {settings}")
+        legacy = self.root / ".codex/skills"
+        blocked = {NAME} if self.manifest.get("tool_digest") else set()
+        self.skills(canonical, targets, self.manifest["links"], self.root, blocked,
+                    adoption=[legacy] if legacy.is_dir() else [])
+        self.retire_legacy_skills(canonical, self.manifest["links"], self.root, blocked=blocked)
+        for relative in (".claude/settings.json", ".claude/settings.local.json", ".codex/hooks.json"):
+            read_json(self.root / relative, {})  # Validate existing configuration without installing hooks.
         self.mcp(self.root / ".agents/mcp.json", self.manifest["mcp"], imported=imported_mcp)
         self.write(self.root / ".agents/agent-sync.json", json_text(self.manifest))
-        if self.apply and not self.hook:
+        if self.apply:
             self.registry["projects"][str(self.root)] = {"scope": "project"}
             self.write(self.registry_path, json_text(self.registry), 0o600)
-        if self.registry.get("hook_commands") and not self.registry.get("global_hooks_audit_only"):
-            self.notes.append("Legacy global hooks may still repair personal resources. Upgrade them explicitly with agent-sync-config --scope global; project setup leaves them untouched.")
+        if self.registry.get("hook_commands"):
+            self.notes.append("Legacy global sync hooks remain on this machine. Explicit global sync retires them; this project operation leaves global configuration untouched.")
         return self
-
-
-def stamp(path: Path):
-    try:
-        value = path.lstat()
-        result = [value.st_dev, value.st_ino, value.st_mode, value.st_size, value.st_mtime_ns, value.st_ctime_ns]
-        if path.is_symlink():
-            result.append(os.readlink(path))
-            try:
-                target = path.stat()
-                result += [target.st_ino, target.st_size, target.st_mtime_ns, target.st_ctime_ns]
-            except FileNotFoundError:
-                result.append("broken")
-        return result
-    except FileNotFoundError:
-        return None
-
-
-def fingerprint(sync: Sync):
-    if sync.scope == "project":
-        paths = [sync.root / name for name in (".git", "AGENTS.md", "AGENTS.override.md", "CLAUDE.md",
-                 ".claude/CLAUDE.md", ".agents/agent-sync.json", ".agents/mcp.json", ".mcp.json", ".codex/config.toml",
-                 ".codex/hooks.json", ".agents/context", ".claude/context", ".codex/context",
-                 ".claude/settings.json", ".claude/settings.local.json")]
-        skill_dirs = [sync.root / name for name in (".agents/skills", ".claude/skills", ".codex/skills")]
-    else:
-        paths = [sync.registry_path, sync.personal / ".agent-sync.json", sync.personal / "AGENTS.md", sync.personal / "mcp.json", sync.cli_lock_path()]
-        paths += [sync.home / name for name in (".codex/AGENTS.md", ".codex/AGENTS.override.md", ".claude/CLAUDE.md",
-                  ".codex/config.toml", ".claude.json", ".codex/hooks.json", ".claude/settings.json", ".local/bin/agent-sync-config")]
-        skill_dirs = [sync.personal / "skills", sync.home / ".agents/skills", sync.home / ".claude/skills", sync.home / ".codex/skills"]
-    result = {str(path): stamp(path) for path in paths}
-    for directory in skill_dirs:
-        result[str(directory)] = stamp(directory)
-        if directory.is_dir():
-            for child in sorted(directory.iterdir()):
-                if child.name.startswith("."):
-                    continue
-                result[str(child)] = stamp(child)
-                result[str(child / "SKILL.md")] = stamp(child / "SKILL.md")
-    return digest(json_text(result).encode())
 
 
 @contextmanager
@@ -1476,69 +1449,8 @@ def lock(home: Path):
 
 
 def hook(args):
-    event = "UserPromptSubmit"
-    scope = args.scope or "project"
-    try:
-        payload = json.load(sys.stdin)
-        if not isinstance(payload, dict):
-            raise ConfigError("Hook input must be an object")
-        home = Path(args.home).expanduser().resolve()
-        scope = args.scope or "project"  # Legacy handlers never authorize global repair.
-        root = root_for(Path(payload.get("cwd", os.getcwd()))) if scope == "project" else None
-        sync = Sync(home, root, False, scope=scope, hook=True)
-        if scope == "project":
-            registration = sync.registry.get("projects", {}).get(str(root))
-            if sync.old is None or (sync.old.get("scope") != "project" and registration is None):
-                return 0
-        elif not (sync.personal / ".agent-sync.json").is_file():
-            return 0
-        # Unknown permission modes fail closed for mutation, but still audit.
-        writable = payload.get("permission_mode") in {"default", "acceptEdits", "auto", "dontAsk", "bypassPermissions"}
-        # Current Codex payloads omit sandbox policy, and exec can report
-        # bypassPermissions even with --sandbox read-only. Never infer write access.
-        if args.provider == "codex":
-            writable = writable and payload.get("sandbox_mode") in {"workspace-write", "danger-full-access"}
-        writable = writable and payload.get("sandbox_mode") != "read-only" and os.environ.get("AGENT_SYNC_READ_ONLY") != "1"
-        writable = writable and scope == "project"
-        cache_key = scope + ":" + str(root if scope == "project" else sync.personal)
-        cache_path = sync.state_dir / "cache" / (digest(cache_key.encode())[:24] + ".json")
-        cache = read_json(cache_path, {})
-        current = fingerprint(sync)
-        instruction_stamp = [stamp((root if scope == "project" else sync.personal) / "AGENTS.md")]
-        event = payload.get("hook_event_name", "UserPromptSubmit")
-        session = args.provider + ":" + str(payload.get("session_id", "unknown"))
-        previous_instructions = cache.get("sessions", {}).get(session)
-        refresh = event == "SessionStart" or previous_instructions != instruction_stamp
-        if cache.get("healthy") and cache.get("fingerprint") == current:
-            pass
-        else:
-            sync.run()
-            if sync.changes and writable:
-                # Audit-only handlers do not contend with project repairs.
-                with lock(home):
-                    Sync(home, root, True, scope="project", hook=True).run()
-                    sync = Sync(home, root, False, scope="project", hook=True).run()
-        messages = sync.issues + ["Synchronization required: " + change for change in sync.changes]
-        if refresh:
-            messages.append("Read AGENTS.md before continuing; its content may have changed. Curated .agents/context/ files are read when relevant." if scope == "project" else "Read shared personal AGENTS.md before continuing; its content may have changed.")
-        if messages:
-            print(json.dumps({"hookSpecificOutput": {"hookEventName": event,
-                  "additionalContext": "agent-sync-config: " + "\n".join(messages) + f"\nUse agent-sync-config --scope {scope} to reconcile reported conflicts before unrelated work."}}))
-        if os.environ.get("AGENT_SYNC_READ_ONLY") != "1":
-            cache["healthy"] = not sync.issues and not sync.changes
-            cache["fingerprint"] = fingerprint(sync)
-            sessions = cache.setdefault("sessions", {})
-            sessions[session] = instruction_stamp
-            cache["sessions"] = dict(list(sessions.items())[-64:])
-            sync.apply = True
-            # Hooks may cache metadata outside the repo even when managed files
-            # are read-only. CLI check does not write this cache or acquire a lock.
-            sync.write(cache_path, json_text(cache), 0o600)
-        return 0
-    except (ConfigError, OSError, ValueError, KeyError, TypeError) as exc:
-        print(json.dumps({"hookSpecificOutput": {"hookEventName": event,
-              "additionalContext": f"agent-sync-config could not verify configuration ({type(exc).__name__}). Run agent-sync-config check --scope {scope} and resolve it before unrelated work."}}))
-        return 0
+    # Compatibility for old machine-installed handlers: no execution or writes.
+    return 0
 
 
 def confirm_changes(result, args):
@@ -1602,7 +1514,8 @@ def interactive_removals(home, args):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", nargs="?", choices=("sync", "check", "hook", "remove-skill", "uninstall"), default="sync")
+    parser.add_argument("action", nargs="?", choices=("sync", "check", "hook", "remove-skill", "uninstall"), default="sync",
+                        help="sync/check shared references, or remove-skill/uninstall globally; hook is a retired no-op")
     parser.add_argument("skill_name", nargs="?", help="Owned skill to remove")
     parser.add_argument("--dry-run", action="store_true", help="Preview without writes or locks")
     parser.add_argument("--yes", action="store_true", help="Confirm an explicit cleanup; does not resolve ambiguous removals")

@@ -1,6 +1,6 @@
 ---
 name: agent-sync-config
-description: Set up, check, or synchronize shared instructions, skills, curated project context, and MCP configuration across Codex and Claude Code. Use for a new repository, configuration drift, a client switch, an explicit global configuration request, or removing/uninstalling shared global skills.
+description: Set up, check, or synchronize shared instructions, skills, curated project context, and MCP configuration across Codex and Claude Code. Use for a new repository, configuration drift, reference drift, an explicit global configuration request, or removing/uninstalling shared global skills.
 ---
 
 # Agent Sync Config
@@ -37,10 +37,11 @@ python3 <skill-directory>/scripts/agent_sync_config.py --scope project --project
 python3 <skill-directory>/scripts/agent_sync_config.py --scope global
 ```
 
-Project setup packages this skill's runtime and licenses in the repository and
-installs native project hooks. Global setup manages personal resources, installs
-the terminal wrapper, and installs audit-only global hooks. The same scoped command
-initializes missing resources and reconciles existing setup.
+Project setup creates shared configuration, relative skill links, and a small
+ownership manifest. It never installs this skill, a tool runtime, or automatic
+hooks in the project. Global setup manages personal resources and the terminal
+wrapper without automatic hooks. The tool stays installed on the machine.
+The same scoped command initializes missing resources and reconciles existing setup.
 
 ## Check and reconcile
 
@@ -67,16 +68,19 @@ Use `--personal-root` only with global scope. `--project-only` remains a project
 scope alias. Do not copy credentials, conversations, automatic memory, plugin
 caches, or provider-specific capabilities into shared files.
 
-Honor the managed AGENTS.md section. Read updated instructions when switching
-clients or when hooks indicate changed instructions. Project hooks audit and may
-repair project resources when native permissions permit. Global hooks only report
-personal drift: repair requires explicit global sync. Hook file presence does not
-prove trust or execution; explain reported native trust/restart steps.
+Instruction and skill edits are shared immediately through imports/links. Invoke
+sync to adopt new resources, repair references, reconcile conflicts, or regenerate
+MCP output. No prompt hook or automatic repair is installed. The global Codex
+skill entrypoint is ~/.agents/skills; do not create duplicate ~/.codex/skills links.
 
-For installations predating 0.2.0, project setup may report legacy global hooks.
-Explain the one-time explicit global upgrade; do not perform it unless the user
-chooses global synchronization. Existing project registration does not authorize
-global changes.
+Explicit project sync migrates recorded unchanged legacy project hooks, packaged
+setup runtime, and its owned discovery links. Explicit global sync separately
+retires recorded legacy global hooks and verified owned Codex aliases. Preserve
+modified or unowned artifacts, disabled-hook/trust controls, and system skills.
+Explain reported migration conflicts without bypassing native trust. Read-only
+checks never apply migration. A legacy global hook's message is not evidence that
+a project operation synchronized global files; inspect the resolved scope and
+reported paths before diagnosing a scope violation.
 
 Portable resources from plugins require explicit adoption with `--import-skill`
 or `--import-mcp` into the selected scope; resolve dependencies first. The tool
@@ -100,7 +104,8 @@ that operation. It does not decide ambiguous external removals. To delete
 redundant owned personal sources after preserving native configuration, add
 `--purge-shared-sources` to uninstall only when requested. Uninstall preserves
 native instructions, remaining skills, MCP settings, unrelated hooks, and projects.
-It removes the owned setup skill, global handlers, wrapper, and registration.
+It removes the owned setup skill, any recorded legacy global handlers, wrapper,
+and registration without recreating legacy Codex aliases.
 Use uninstall rather than remove-skill for agent-sync-config itself.
 
 Direct `npx skills remove --global` cannot delete our retained personal source.
@@ -111,7 +116,7 @@ removal with uninstall. For restoration, run interactive terminal sync when
 available, or explicitly import the retained shared skill source after the user
 chooses restoration. A reported reinstall can be accepted through explicit
 --import-skill adoption from its new ordinary source. Never infer the answer
-from --yes or a missing file. Hooks/check stay audit-only for global resources.
+from --yes or a missing file. Checks remain strictly read-only.
 
 Conflicts block deletion. Preserve them and explain the paths requiring
 reconciliation. An interrupted uninstall keeps recovery metadata; retry with

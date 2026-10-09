@@ -26,7 +26,7 @@ def snapshot(root):
             continue
         key = str(path.relative_to(root))
         result[key] = (os.readlink(path) if path.is_symlink() else
-                       path.read_bytes() if path.is_file() else "directory", sync.stamp(path))
+                       path.read_bytes() if path.is_file() else "directory", (path.lstat().st_mode, path.lstat().st_size, path.lstat().st_mtime_ns, path.lstat().st_ctime_ns))
     return result
 
 
@@ -76,14 +76,11 @@ class ConfigurationTests(unittest.TestCase):
         self.assertTrue(report["changes"])
         self.assertEqual((self.repo / "README.md").read_text(), "existing")
         self.assertEqual((self.repo / "CLAUDE.md").read_text(), "@AGENTS.md\n")
-        self.assertTrue((self.repo / ".codex/hooks.json").is_file())
+        self.assertFalse((self.repo / ".codex/hooks.json").exists())
+        self.assertFalse((self.repo / ".claude/settings.json").exists())
         self.assertFalse((self.repo / ".mcp.json").exists())
-        for relative in (".agents/skills/agent-sync-config", ".claude/skills/agent-sync-config"):
-            self.assertTrue((self.repo / relative / "SKILL.md").is_file())
-            self.assertEqual((self.repo / relative / "LICENSE").read_bytes(), (ROOT / "LICENSE").read_bytes())
-            self.assertTrue((self.repo / relative / "scripts/vendor/TOMLKIT-LICENSE").is_file())
-            self.assertTrue((self.repo / relative / "scripts/vendor/NOTICE").is_file())
-        self.assertTrue((self.repo / ".claude/skills/agent-sync-config").is_symlink())
+        self.assertFalse((self.repo / ".agents/skills/agent-sync-config").exists())
+        self.assertFalse((self.repo / ".claude/skills/agent-sync-config").exists())
         self.assertFalse((self.home / ".local/bin/agent-sync-config").exists())
         before = snapshot(self.base)
         self.assertEqual(self.run_tool()["changes"], [])
@@ -235,10 +232,10 @@ class ConfigurationTests(unittest.TestCase):
         self.assertIn("# Preserve managed comments", text)
         self.assertIn('command = "node" # interpreter', text)
 
-    def test_disabled_hooks_are_reported_without_enabling_them(self):
+    def test_disabled_hooks_are_preserved_without_sync_hook_requirements(self):
         path = self.write(".codex/config.toml", "[features]\nhooks = false\n")
         settings = self.write(".claude/settings.local.json", '{"disableAllHooks": true}')
-        self.run_tool(expected=1)
+        self.run_tool()
         self.assertIn("hooks = false", path.read_text())
         self.assertTrue(json.loads(settings.read_text())["disableAllHooks"])
 
@@ -246,7 +243,7 @@ class ConfigurationTests(unittest.TestCase):
         self.run_tool(scope="global")
         skill = self.skill("agent-config/skills/review-code", home=True)
         before = snapshot(self.home / "agent-config")
-        self.assertIn("Synchronization required", json.dumps(self.hook(provider="claude", scope="global")))
+        self.assertEqual(self.hook(provider="claude", scope="global"), {})
         self.assertEqual(snapshot(self.home / "agent-config"), before)
         self.assertFalse((self.home / ".agents/skills/review-code").exists())
         self.run_tool(scope="global")
@@ -350,49 +347,6 @@ class ConfigurationTests(unittest.TestCase):
         self.assertIn("agent-sync-config", report["pending_removals"])
         self.assertFalse((self.home / ".claude/skills/agent-sync-config").exists())
 
-    def test_hooks_normal_plan_unknown_mode_and_read_only_sandbox(self):
-        self.skill(".agents/skills/review-code")
-        self.run_tool()
-        link = self.repo / ".claude/skills/review-code"
-        for mode, extra in (("plan", None), (None, None), ("default", {"sandbox_mode": "read-only"})):
-            link.unlink(missing_ok=True)
-            before = snapshot(self.repo)
-            output = self.hook(mode=mode, extra=extra)
-            self.assertTrue(output)
-            self.assertFalse(link.exists())
-            self.assertEqual(snapshot(self.repo), before)
-        self.hook(provider="claude")
-        self.assertTrue(link.is_symlink())
-        self.assertEqual(self.hook(provider="claude"), {})
-        self.assertTrue(self.hook(event="SessionStart", session="resumed"))
-        self.assertTrue(self.hook(provider="claude", session="switched-client"))
-
-    def test_codex_unknown_sandbox_is_audit_only_even_with_bypass_permissions(self):
-        self.skill(".agents/skills/review-code"); self.run_tool()
-        link = self.repo / ".claude/skills/review-code"; link.unlink()
-        before = snapshot(self.repo)
-        self.assertTrue(self.hook(mode="bypassPermissions"))
-        self.assertEqual(snapshot(self.repo), before)
-        self.assertFalse(link.exists())
-        self.hook(mode="default", extra={"sandbox_mode": "workspace-write"})
-        self.assertTrue(link.is_symlink())
-
-    def test_hook_does_not_recreate_missing_instructions(self):
-        self.run_tool(); (self.repo / "AGENTS.md").unlink()
-        output = self.hook()
-        self.assertIn("missing", json.dumps(output))
-        self.assertFalse((self.repo / "AGENTS.md").exists())
-
-    def test_instruction_refresh_and_file_replacement_cache_invalidation(self):
-        self.run_tool(); self.hook(); self.assertEqual(self.hook(), {})
-        path = self.repo / "AGENTS.md"
-        content = path.read_text(); original_stat = path.stat()
-        path.write_text(content + "\nNew instructions\n")
-        self.assertIn("Read AGENTS.md", json.dumps(self.hook()))
-        replacement = path.with_suffix(".tmp"); replacement.write_text(content)
-        os.utime(replacement, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns)); replacement.replace(path)
-        self.assertIn("Read AGENTS.md", json.dumps(self.hook()))
-
     def test_hook_noop_for_unregistered_project(self):
         before = snapshot(self.base)
         self.assertEqual(self.hook(), {})
@@ -430,18 +384,6 @@ class ConfigurationTests(unittest.TestCase):
         imported.write_text('{"description": "not an MCP configuration"}')
         self.run_tool("--import-mcp", str(imported), expected=2)
         self.assertEqual(snapshot(self.repo), before)
-
-    def test_strict_read_only_hook_does_not_cache_or_repair(self):
-        self.skill(".agents/skills/review-code"); self.run_tool()
-        (self.repo / ".claude/skills/review-code").unlink()
-        before = snapshot(self.base)
-        payload = {"cwd": str(self.repo), "permission_mode": "default", "session_id": "strict-read-only"}
-        result = subprocess.run([sys.executable, str(SCRIPT), "hook", "--provider", "claude", "--home", str(self.home)],
-                                input=json.dumps(payload), capture_output=True, text=True,
-                                env={**os.environ, "AGENT_SYNC_READ_ONLY": "1"})
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("Synchronization required", result.stdout)
-        self.assertEqual(snapshot(self.base), before)
 
     def test_fresh_unscoped_json_and_noninteractive_fail_before_writes(self):
         before = snapshot(self.base)
@@ -543,6 +485,8 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual(personal_snapshot(), before)
         (self.repo / ".claude/skills/review-code").unlink()
         self.hook(provider="claude")
+        self.assertFalse((self.repo / ".claude/skills/review-code").exists())
+        self.run_tool()
         self.assertTrue((self.repo / ".claude/skills/review-code").is_symlink())
         self.assertEqual(personal_snapshot(), before)
 
@@ -556,78 +500,12 @@ class ConfigurationTests(unittest.TestCase):
                            if not key.startswith(".local/state") and key != ".local"}
         for provider in ("claude", "codex"):
             output = self.hook(provider=provider, scope="global", extra={"sandbox_mode": "workspace-write"})
-            self.assertIn("--scope global", json.dumps(output))
+            self.assertEqual(output, {})
             self.assertFalse((self.home / ".claude/skills/agent-sync-config").exists())
         after = {key: value for key, value in snapshot(self.home).items()
                  if not key.startswith(".local/state") and key != ".local"}
         self.assertEqual(after, personal_before)
         self.assertEqual(snapshot(self.repo), before)
-
-    def test_portable_project_hooks_after_relocation_nested_worktree_and_new_home(self):
-        self.write(".git", "gitdir: /elsewhere/worktrees/fixture\n")
-        self.skill(".agents/skills/review-code")
-        self.run_tool()
-        commands = json.loads((self.repo / ".codex/hooks.json").read_text())["hooks"]
-        command = commands["UserPromptSubmit"][0]["hooks"][0]["command"]
-        self.assertNotIn(str(self.repo), command)
-        self.assertNotIn(str(self.home), command)
-        relocated = self.base / "relocated checkout"
-        self.repo.rename(relocated)
-        nested = relocated / "src/nested"; nested.mkdir(parents=True)
-        new_home = self.base / "new home"; new_home.mkdir()
-        payload = {"cwd": str(nested), "permission_mode": "default", "sandbox_mode": "workspace-write",
-                   "session_id": "relocated", "hook_event_name": "UserPromptSubmit"}
-        link = relocated / ".claude/skills/review-code"; link.unlink()
-        result = subprocess.run(command, shell=True, input=json.dumps(payload), cwd=nested,
-                                env={**os.environ, "HOME": str(new_home)}, capture_output=True, text=True)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertTrue(link.is_symlink())
-        self.assertIn("Read AGENTS.md", result.stdout)
-        self.assertFalse((new_home / "agent-config").exists())
-        result = subprocess.run(command, shell=True, input=json.dumps(payload), cwd=nested,
-                                env={**os.environ, "HOME": str(new_home)}, capture_output=True, text=True)
-        self.assertEqual(result.stdout, "", result.stderr)
-
-    def test_project_hook_ownership_and_local_runtime_edits(self):
-        self.write(".codex/hooks.json", json.dumps({"hooks": {"SessionStart": [
-            {"matcher": "startup", "hooks": [{"type": "command", "command": "unrelated"}]}]}}))
-        self.run_tool()
-        doc = json.loads((self.repo / ".codex/hooks.json").read_text())
-        self.assertEqual(doc["hooks"]["SessionStart"][0]["matcher"], "startup")
-        self.assertEqual(doc["hooks"]["SessionStart"][0]["hooks"][0]["command"], "unrelated")
-        manifest = json.loads((self.repo / ".agents/agent-sync.json").read_text())
-        self.assertEqual(set(manifest["hook_commands"]), {"codex", "claude"})
-        runtime = self.repo / ".agents/skills/agent-sync-config/scripts/agent_sync_config.py"
-        runtime.write_text(runtime.read_text() + "\n# local edit\n")
-        self.assertIn("local edits", json.dumps(self.run_tool(expected=1)))
-        self.assertTrue(runtime.read_text().endswith("# local edit\n"))
-
-    def test_legacy_global_upgrade_is_explicit_and_project_registration_not_global_authority(self):
-        self.run_tool(scope="global")
-        registry_path = self.home / ".local/state/agent-sync-config/registry.json"
-        registry = json.loads(registry_path.read_text())
-        registry.pop("global_hooks_audit_only")
-        registry["projects"][str(self.repo)] = {"project_only": False}
-        for provider, path in (("codex", self.home / ".codex/hooks.json"), ("claude", self.home / ".claude/settings.json")):
-            doc = json.loads(path.read_text())
-            old_command = "legacy-combined-" + provider
-            for event in ("SessionStart", "UserPromptSubmit"):
-                doc["hooks"][event][0]["hooks"][0]["command"] = old_command
-            path.write_text(json.dumps(doc))
-            registry["hook_commands"][provider] = [old_command]
-        registry_path.write_text(json.dumps(registry))
-        before = snapshot(self.home / ".codex")
-        self.assertIn("Legacy global hooks", json.dumps(self.run_tool()["notes"]))
-        self.assertEqual(snapshot(self.home / ".codex"), before)
-        (self.home / ".claude/skills/agent-sync-config").unlink()
-        self.hook(provider="claude")
-        self.assertFalse((self.home / ".claude/skills/agent-sync-config").exists())
-        (self.home / ".claude/skills/agent-sync-config").symlink_to("../../agent-config/skills/agent-sync-config")
-        self.run_tool(scope="global")
-        registry = json.loads(registry_path.read_text())
-        self.assertTrue(registry["global_hooks_audit_only"])
-        self.assertNotIn("legacy-combined", (self.home / ".codex/hooks.json").read_text())
-        self.assertIn("--scope global", (self.home / ".codex/hooks.json").read_text())
 
     def test_explicit_imports_apply_only_to_selected_scope(self):
         skill = self.base / "portable"; skill.mkdir()
@@ -649,7 +527,7 @@ class ConfigurationTests(unittest.TestCase):
         directory = self.repo / ".claude"; directory.mkdir()
         (directory / "settings.json").symlink_to(settings)
         before = snapshot(self.home / ".claude")
-        self.run_tool(expected=2)
+        self.run_tool()
         self.assertEqual(snapshot(self.home / ".claude"), before)
 
     def test_strict_read_only_hook_in_clone_does_not_create_runtime_state(self):
@@ -669,16 +547,8 @@ class ConfigurationTests(unittest.TestCase):
             for scope in ("project", "global"):
                 output = self.hook(mode="plan", scope=scope)
                 self.assertNotIn("could not verify", json.dumps(output))
-                self.assertIn("Read", json.dumps(output))
+                self.assertEqual(output, {})
 
-    def test_project_hooks_audit_missing_native_handlers_without_reinstalling(self):
-        self.run_tool()
-        (self.repo / ".claude/settings.json").unlink()
-        output = self.hook(provider="claude")
-        self.assertIn("Synchronization required", json.dumps(output))
-        self.assertFalse((self.repo / ".claude/settings.json").exists())
-        self.run_tool()
-        self.assertTrue((self.repo / ".claude/settings.json").exists())
 
 
 if __name__ == "__main__":

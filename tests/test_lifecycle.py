@@ -121,7 +121,7 @@ class LifecycleTests(unittest.TestCase):
         result = subprocess.run([sys.executable, str(SCRIPT), "hook", "--scope", "global", "--provider", "claude", "--home", str(self.home)],
                                 input=payload, capture_output=True, text=True, env={**os.environ, "AGENT_SYNC_READ_ONLY": "1"})
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("Pending skill removal", result.stdout)
+        self.assertEqual(result.stdout, "")
         self.assertEqual(snapshot(self.base), before)
         self.cli("--yes", code=1)
         self.assertFalse((self.home / ".claude/skills/review-code").exists())
@@ -187,8 +187,8 @@ class LifecycleTests(unittest.TestCase):
         self.cli()
         native_mcp = (self.home / ".codex/config.toml").read_bytes()
         claude = self.home / ".claude/settings.json"
-        doc = json.loads(claude.read_text()); doc["permissions"] = {"deny": ["Read(secret)"]}; doc["disableAllHooks"] = True
-        doc["hooks"]["SessionStart"].append({"matcher": "startup", "hooks": [{"type": "command", "command": "unrelated"}]})
+        doc = {}; doc["permissions"] = {"deny": ["Read(secret)"]}; doc["disableAllHooks"] = True
+        doc["hooks"] = {"SessionStart": [{"matcher": "startup", "hooks": [{"type": "command", "command": "unrelated"}]}]}
         claude.write_text(json.dumps(doc))
         instructions = (self.personal / "AGENTS.md").read_bytes()
         before = snapshot(self.base)
@@ -342,7 +342,8 @@ class LifecycleTests(unittest.TestCase):
         shutil.rmtree(vcs)
         self.cli()
         path = self.home / ".claude/settings.json"
-        doc = json.loads(path.read_text())
+        path.parent.mkdir(parents=True, exist_ok=True)
+        doc = {"hooks": {}}
         doc["hooks"]["OtherEvent"] = [{"matcher": "anything", "hooks": [], "extra": "keep"}]
         path.write_text(json.dumps(doc))
         self.cli("uninstall", "--yes")

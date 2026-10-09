@@ -85,7 +85,7 @@ def main():
         assert not (home / ".codex/AGENTS.md").is_symlink()
         assert not (home / ".claude/CLAUDE.md").is_symlink()
         for relative in (".codex/hooks.json", ".claude/settings.json"):
-            doc = json.loads((home / relative).read_text())
+            doc = json.loads((home / relative).read_text()) if (home / relative).exists() else {}
             assert not any(doc.get("hooks", {}).values())
         results["setup_skill_removal_and_installed_self_uninstall"] = "passed"
     print(json.dumps(results, indent=2))

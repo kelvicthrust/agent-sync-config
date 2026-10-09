@@ -1,8 +1,7 @@
 # Testing and compatibility
 
-Run these checks from a checkout of this repository. Python 3.11+ is required.
-Use disposable projects and homes to review setup without installing shared
-resources into your personal configuration.
+Use Python 3.11+ and disposable homes/projects. Tests must not copy credentials,
+change personal configuration, or contact model providers.
 
 ## Automated checks
 
@@ -11,177 +10,136 @@ python3 -m unittest discover -s tests -v
 python3 tests/benchmark.py
 ```
 
-The suite covers initialization, existing-resource adoption, conflicts,
-idempotence, installed licenses, instructions, skills, context, MCP rendering
-and ownership, native settings/plugin preservation, malformed inputs, read-only
-behavior, hooks, and cache invalidation. Scope tests cover first-run selection,
-cancellation, marker detection, argument conflicts, protected targets, snapshots
-of the opposite scope, relocation/worktrees, ownership, legacy upgrade, and
-audit-only global hooks. Global lifecycle tests cover ownership migration,
-confirmed removal, cancellation, tombstones/reinstallation, external removal
-decisions, lockfile preservation, native materialization, purge, conflicting
-artifacts, detached setup, custom roots, and interrupted uninstall recovery. It does not use model credentials or
-contact model providers.
+The suite covers instructions, skills, context, MCP round trips, conflicts,
+provider settings, project/global scope isolation, first-run scope selection,
+read-only checks, imports, persistent removals, uninstall/purge, and recovery.
+Simplification tests cover minimal project setup, immediate sharing, relocation,
+legacy hook/runtime migration, modified artifacts, obsolete Codex aliases,
+unrelated hooks, disabled controls, and idempotence.
 
-The benchmark measures project and global warm metadata checks, including Python startup. It reports
-a 100 ms target without making scheduling-dependent timings a CI failure.
-Results depend on the host and filesystem.
+The benchmark measures explicit project/global read-only checks with 30 skills,
+including Python startup. No prompt hooks or warm metadata caches are installed;
+timings are informational and depend on the host/filesystem.
 
-CI runs these commands on macOS and Linux with Python 3.11 and 3.13. A configured
-matrix is not evidence of a successful run; inspect the workflow results for the
-commit being evaluated. CI does not require model credentials.
+## Manual project checks
 
-## Disposable setup
+From a checkout, point the runtime at disposable directories:
 
 ```sh
-AGENT_SYNC_DEMO=$(mktemp -d)
-mkdir -p "$AGENT_SYNC_DEMO/home" "$AGENT_SYNC_DEMO/repo"
-./bin/agent-sync-config --scope project --home "$AGENT_SYNC_DEMO/home" \
-  --project "$AGENT_SYNC_DEMO/repo" --json
-./bin/agent-sync-config check --scope project --home "$AGENT_SYNC_DEMO/home" \
-  --project "$AGENT_SYNC_DEMO/repo" --json
-./bin/agent-sync-config --scope project --home "$AGENT_SYNC_DEMO/home" \
-  --project "$AGENT_SYNC_DEMO/repo" --json
+sandbox=$(mktemp -d)
+mkdir -p "$sandbox/home" "$sandbox/repo"
+./bin/agent-sync-config --scope project --home "$sandbox/home" --project "$sandbox/repo"
+./bin/agent-sync-config check --scope project --home "$sandbox/home" --project "$sandbox/repo"
 ```
 
-The check should succeed, and the second sync should report no changes. Inspect
-the project and external runtime state to see the footprint. Personal/provider
-configuration must remain absent. To test global setup separately, run:
+Expect AGENTS.md, a CLAUDE.md import wrapper, `.agents/agent-sync.json`, and empty
+canonical skill/context directories. No setup-skill runtime, Python dependencies,
+`.codex/hooks.json`, or Claude hook settings should be created.
+
+Create a skill in `.agents/skills`, then sync. Claude's per-skill relative link
+must reference it. Edit the shared skill through either path and verify the other
+path sees the edit immediately. Move the fixture and verify the links still work.
+Existing Claude instructions and skills should be adopted when compatible;
+differing instructions or skill contents must be preserved and reported.
+
+Removing a project skill link should produce drift in a strictly read-only check.
+Only an explicit project sync repairs it. New resources do not trigger automatic
+adoption, and no prompt should require trust for a synchronizer hook.
+
+## Global checks and lifecycle
 
 ```sh
-./bin/agent-sync-config --scope global --home "$AGENT_SYNC_DEMO/home" --json
-./bin/agent-sync-config check --scope global --home "$AGENT_SYNC_DEMO/home" --json
+./bin/agent-sync-config --scope global --home "$sandbox/home"
+./bin/agent-sync-config check --scope global --home "$sandbox/home"
+./bin/agent-sync-config remove-skill review-code --scope global --home "$sandbox/home" --dry-run
+./bin/agent-sync-config uninstall --scope global --home "$sandbox/home" --dry-run
+./bin/agent-sync-config uninstall --scope global --home "$sandbox/home" --purge-shared-sources --yes
 ```
 
-The project must remain unchanged during those global operations. Keep the explicit `--home`
-argument on every test command; it controls the synchronizer's destination, not
-the native clients' authentication or configuration directories.
+Global setup uses one personal source and supported native links, with no new
+`.codex/skills` aliases or hooks. Instructions and skill edits are shared through
+links. MCP requires explicit rendering. Snapshot all project files across global
+operations and all personal/provider files across project operations.
 
-For adoption tests, start a separate fixture with existing CLAUDE.md, provider
-skills, or nonsecret MCP definitions. Conflicting instruction or skill contents
-must remain preserved and be reported. Remove a managed project skill link: `check`
-should report drift without writing files, and explicit project sync should restore it.
-For a global skill, missing links instead require an explicit removal/restoration
-decision; checks/hooks and noninteractive sync never silently recreate them.
-Keep an application file in the fixture and confirm it remains unchanged.
+A missing supported global skill entrypoint or observed Skills CLI record requires
+an explicit removal/restoration decision. Checks and noninteractive sync never
+silently reinstall it; `--yes` does not select that decision. Tombstones prevent
+adoption of remaining provider copies. Dry runs, cancellation, and missing
+confirmation must leave fixtures unchanged, including locks and caches.
+
+Uninstall must preserve native instructions, skills and MCP; remove only owned
+integration; and leave projects and unrelated settings/hooks intact. Purge must
+verify native replacements before deleting owned shared sources. Do not recreate
+legacy Codex aliases. Test custom roots, paths with spaces, malformed metadata,
+modified artifacts, private VCS data, repeat execution, and interrupted cleanup.
+
+## Migration fixtures
+
+Seed a disposable pre-0.4 manifest with its recorded runtime digest, discovery
+links, and native hook commands. A check must report required migration without
+writes. Explicit sync must back up and retire only unchanged owned artifacts.
+Modified packages, handlers, matcher groups, or redirected links must remain
+preserved and reported. Preserve unrelated/empty hook groups and settings modes.
+
+Verify canonical skill replacements before retiring owned legacy Codex aliases.
+Migration updates both link and per-skill ownership so retired aliases are not
+recreated or reported as pending removals. Missing supported entrypoints still
+require a removal decision. Global and project migrations operate independently.
+
+The observed existing-project setup can be reproduced by copying only its agent
+configuration into a disposable Git repository. Keep private instructions out of
+committed fixtures and never run migration against the original repository.
 
 ## Native discovery and installation
 
-If native client binaries are available:
-
 ```sh
-python3 tests/provider_smoke.py --codex /path/to/codex --claude /path/to/claude
-```
-
-The smoke test checks native skill discovery, hook parsing/trust status, and MCP
-configuration loading. It uses a temporary HOME and labels absent clients
-explicitly. No model turn is requested; native clients may independently make
-background network requests.
-
-To verify installation through an available official skills CLI:
-
-```sh
-python3 tests/provider_smoke.py \
-  --codex /path/to/codex --claude /path/to/claude \
-  --skills-cli /path/to/skills/bin/cli.mjs --node /path/to/node
-```
-
-This installs from the local checkout into the temporary home and checks both
-client entrypoints, the project license, and bundled third-party notices.
-
-## Native sessions with a local protocol stub
-
-```sh
-python3 tests/offline_sessions.py --codex /path/to/codex --claude /path/to/claude
-```
-
-This requires localhost socket access. Native clients load instructions and the
-skill, execute hooks, connect to a local stdio MCP fixture, resume sessions, and
-exercise read-only behavior. Claude also exercises safe repair in writable mode.
-No real model credentials are supplied. The protocol stub returns fixed responses
-and does not establish real model compliance.
-
-Codex requests use an explicit project skill path to disambiguate project/global
-copies. Codex's hook-trust bypass in this test is confined to the vetted disposable
-fixture hooks. Production setup and authenticated pilots use native hook review
-and trust controls.
-
-## Authenticated pilot checklist
-
-Use a disposable Git project and synchronizer home. Preserve existing application
-files and install the skill from the checkout. Specify the fixture `--home` and
-`--scope project --project` in every project skill request. Setup installs
-fixture hooks at the native project scope (`.codex/hooks.json` for Codex,
-`.claude/settings.json` for Claude); do not replace personal hook files. Set HOME to the disposable home
-for portable project hooks while retaining the native login through CODEX_HOME
-if needed. Review Codex's fixture hooks through
-`/hooks`; restart Claude after attaching hooks.
-
-An authenticated pilot can use the client's existing login without copying
-credential files. Using normal client configuration also exposes its instructions,
-skills, and MCP context to the model service. Obtain authorization for that scope
-when running a pilot on someone else's behalf. Native clients can save test-session
-and project/hook trust metadata in their real configuration/state directories.
-
-Verify these behaviors:
-
-1. Invoke the installed skill and initialize the fixture; verify adoption and an
-   unchanged repeat run. Review any required native approval.
-2. Remove a managed skill link and submit a normal prompt without manually
-   running a check. Trusted hooks should supply drift information to the model.
-3. In read-only/planning mode, confirm the missing link remains missing and
-   managed files do not change. Hook metadata caching may occur outside the repo.
-4. Request explicit skill sync with the fixture paths, verify the link is repaired,
-   then request a read-only check and confirm it succeeds.
-5. Change an instruction containing a recognizable response marker. Verify both
-   resumed and fresh sessions use the updated instruction. Evaluate the final
-   reply separately from progress commentary.
-6. Connect a credential-free local MCP fixture and invoke its tool. Check the
-   native approval/reconnection behavior and tool result.
-7. Switch clients and repeat the check against the same canonical resources.
-   Confirm application files and unrelated personal settings are preserved.
-
-Do not treat file presence or a model's claimed success as proof of hook execution;
-inspect native trust status, fixture hook logs/state, tool calls, and file changes.
-
-## Verified capabilities and limits
-
-| Environment | Verification |
-| --- | --- |
-| Codex 0.162.0 on macOS | 0.3.0 native discovery before/after global uninstall and protocol-stub sessions; no authenticated model turn |
-| Codex 0.162.0-alpha.2 on macOS | 0.2.0 native discovery and protocol-stub sessions; authenticated trusted project hooks, drift reporting, explicit project repair/check, and fresh/resumed instruction loading |
-| Codex 0.160.0 on macOS | Previous 0.1.0 authenticated native CLI/app-server pilot: setup/adoption, explicit repair, checks, local MCP tool call, trusted hooks, drift reporting, and fresh/resumed instruction loading |
-| Codex 0.142.0 on macOS | Native discovery/parsing and protocol-stub sessions; authenticated model compatibility is not established |
-| Claude Code 2.1.295 on macOS | Native MCP loading and protocol-stub sessions, hooks, resume refresh, planning behavior, and writable repair; authenticated model compliance is not established |
-| Python 3.12.14 on macOS | 76 automated tests passed; 30-skill warm hooks: project 61 ms median / 65 ms p95, global 54 ms median / 58 ms p95 in a local sample |
-| Skills CLI 1.7.1 on macOS | Local installation, no-op/partial/complete global removal, reinstallation acceptance, and installed-runtime self-uninstall |
-| Python 3.14.8 on macOS | Automated scope tests and benchmark also exercised during development |
-| Python 3.11/3.13 on macOS/Linux | CI targets; consult actual workflow results |
-
-These are tested versions, not minimum supported client versions. Desktop GUI,
-cloud sessions, and additional client adapters are not verified.
-
-The tested Codex hook payloads omit sandbox policy and may report
-`bypassPermissions` even in read-only mode. Hooks therefore audit/report drift;
-repair requires explicit skill sync unless a payload identifies a writable
-sandbox. Claude planning/unknown modes also audit. Disabled or untrusted hooks
-and native policies can prevent checks; model compliance is not guaranteed.
-
-## Skills CLI lifecycle integration
-
-```sh
+python3 tests/provider_smoke.py
+python3 tests/provider_smoke.py --skills-cli /path/to/skills/bin/cli.mjs --node /path/to/node
 python3 tests/skills_lifecycle.py --skills-cli /path/to/skills/bin/cli.mjs --node /path/to/node
 ```
 
-This uses the actual Skills CLI in disposable homes to verify no-op removal,
-partial-provider removal, complete global removal, setup-skill removal, and
-reinstallation acceptance. It installs from local fixtures without model
-credentials or telemetry. The script reports the CLI version under test.
-Never run removal integration tests from the publisher checkout itself.
+These scripts use disposable homes, local skill installation and native discovery
+without requesting a model turn. Verify one enabled entry per managed skill
+within each scope, working Claude links/imports, no synchronizer hooks, and native
+MCP loading before and after global uninstall. Global/project copies may coexist.
+The Skills CLI lifecycle script exercises no-op, partial-provider, complete and
+setup-skill removal, reinstall acceptance, and installed-runtime self-uninstall.
+Never run removal tests against the publisher checkout itself.
 
-Lifecycle dry runs and refusal/cancellation must leave the entire fixture
-unchanged, including locks and caches. After uninstall, native discovery should
-find remaining skills and no setup skill, global hooks should contain only
-unrelated handlers, and native MCP content should be unchanged. Purge must remove
-only owned shared sources after native preservation. The automated suite injects
-an interruption after source/runtime removal and verifies retry completion.
+## Optional offline sessions
+
+```sh
+python3 tests/offline_sessions.py
+```
+
+This uses a localhost protocol stub and dummy keys to exercise native instruction
+loading, machine-installed skill invocation, MCP, planning/read-only behavior,
+and resume. It does not use real inference or credentials. No hook-trust bypass
+is needed. Prompts must not automatically repair references or create hook caches;
+an explicit sync repairs a missing link afterward. Localhost access is required.
+
+## Compatibility evidence
+
+Initial support is local macOS/Linux with Python 3.11+. CI targets Python 3.11
+and 3.13; inspect actual workflow results before publishing a release.
+
+Historical 0.3.0 verification used Python 3.12.14, Codex 0.162.0, Claude Code
+2.1.295, and Skills CLI 1.7.1. Its 76 tests, hook benchmarks and hook-session
+results apply to that version's behavior, not the simplified 0.4.0 workflow.
+Record current verification separately; authenticated model compliance, desktop
+GUI workflows, and cloud behavior are not established by native discovery or a
+protocol stub. Cursor and Grok integrations remain future work.
+
+Current 0.4.0 local verification:
+
+| Environment | Result |
+| --- | --- |
+| Python 3.12.14 on macOS | 75 automated tests passed |
+| Codex 0.162.0 | One entry per managed skill, no synchronizer hooks, native MCP and offline stub sessions passed |
+| Claude Code 2.1.295 | Native MCP, on-disk skill references, and offline stub sessions passed |
+| Skills CLI 1.7.1 | Local installation, external removals, persistent removal, reinstall acceptance, and installed-runtime self-uninstall passed |
+| Existing-project disposable copy | Owned package/hooks removed; original instructions and source repository preserved |
+| Explicit checks, 30 skills | Project 86 ms median / 90 ms p95; global 113 ms median / 135 ms p95 in a concurrent local sample |
+
+No authenticated model sessions were run. The full automated suite ran once after
+implementation settled; focused migration/lifecycle tests ran during development.

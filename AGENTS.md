@@ -12,7 +12,7 @@ Use Python 3.11+ on macOS/Linux. The shipped skill is in
 - Test configuration changes in disposable homes/projects. Do not synchronize
   personal configuration or use authenticated model sessions without authorization.
 - Run `python3 -m unittest discover -s tests -v` for runtime changes. Recheck
-  `python3 tests/benchmark.py` when hooks or their startup path change. Native
+  `python3 tests/benchmark.py` when explicit check behavior changes. Native
   installation/session checks are documented in `docs/testing.md`.
 - For documentation-only edits, check the diff and relevant commands/links;
   successful CI on the final commit is required before publishing a release.
@@ -49,6 +49,6 @@ Use Python 3.11+ on macOS/Linux. The shipped skill is in
 
 Run the skill explicitly in project scope to initialize this repository when
 requested. Preserve these instructions outside its managed section. Edit the
-shipped runtime in `skills/agent-sync-config/`, not the generated copy under
-`.agents/skills/agent-sync-config/`. Inspect generated project resources before
+shipped runtime in `skills/agent-sync-config/`. Projects contain shared
+configuration and links, never a generated runtime or automatic sync hooks. Inspect generated project resources before
 committing them, and never escalate dogfooding to global synchronization implicitly.

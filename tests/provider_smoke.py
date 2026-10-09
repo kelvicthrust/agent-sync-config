@@ -59,27 +59,25 @@ def codex_discovery(binary, env, repo, global_installed=True):
         raise AssertionError(f"Codex did not respond to {method}")
 
     try:
-        request(1, "initialize", {"clientInfo": {"name": "agent-sync-smoke", "version": "0.3.0"},
+        request(1, "initialize", {"clientInfo": {"name": "agent-sync-smoke", "version": "0.4.0"},
                                   "capabilities": {"experimentalApi": True}})
         send({"method": "initialized", "params": {}})
         skills = request(2, "skills/list", {"cwds": [str(repo)], "forceReload": True})
         entries = [skill for entry in skills["data"] for skill in entry["skills"]]
-        assert any(skill["name"] == "agent-sync-config" and skill["enabled"] for skill in entries), skills
-        assert any(skill["name"] == "review-code" and skill["enabled"] for skill in entries), skills
+        assert sum(skill["name"] == "agent-sync-config" and skill["enabled"] for skill in entries) == int(global_installed), skills
+        assert sum(skill["name"] == "review-code" and skill["enabled"] for skill in entries) == 1, skills
         assert not any(entry["errors"] for entry in skills["data"]), skills
-        assert any(skill["name"] == "global-review" and skill["enabled"] for skill in entries), skills
+        assert sum(skill["name"] == "global-review" and skill["enabled"] for skill in entries) == 1, skills
         if not global_installed:
             assert not any(skill["name"] == "agent-sync-config" and str(skill.get("path", "")).startswith(env["HOME"]) for skill in entries), skills
         hooks = request(3, "hooks/list", {"cwds": [str(repo)]})
         assert not any(entry["errors"] for entry in hooks["data"]), hooks
         handlers = [hook for entry in hooks["data"] for hook in entry["hooks"]]
-        assert {"sessionStart", "userPromptSubmit"} <= {hook["eventName"] for hook in handlers}, hooks
-        assert len(handlers) == (4 if global_installed else 2), hooks
-        assert any(str(repo / ".codex/hooks.json") == hook["sourcePath"] for hook in handlers), hooks
+        assert handlers == [], hooks
         config = request(4, "config/read", {"cwd": str(repo), "includeLayers": True})
         assert "local-probe" in config["config"].get("mcp_servers", {}), config
-        return {"skill_discovery": "passed", "hook_parsing": "passed", "mcp_config_loading": "passed",
-                "hook_trust": sorted({hook["trustStatus"] for hook in handlers}),
+        return {"skill_discovery": "passed", "synchronizer_hooks": "absent", "mcp_config_loading": "passed",
+                "duplicate_managed_skills": "none",
                 "model_turn": "not requested"}
     finally:
         selector.close()
@@ -126,12 +124,16 @@ def main():
                 assert (installed / "scripts/vendor/TOMLKIT-LICENSE").is_file()
                 assert (installed / "scripts/vendor/NOTICE").is_file()
             report["skills_cli_installation"] = "passed"
+        (home / ".codex/skills/.system").mkdir(parents=True)
         global_skill = home / ".agents/skills/global-review"
         global_skill.mkdir(parents=True, exist_ok=True)
         (global_skill / "SKILL.md").write_text("---\nname: global-review\ndescription: Review a global fixture.\n---\nReview changes.\n")
         run([sys.executable, str(SCRIPT), "--scope", "global", "--home", str(home)], env, repo)
         run([sys.executable, str(SCRIPT), "--scope", "project", "--home", str(home), "--project", str(repo)], env, repo)
-        # Trust only this disposable test project's config layer; hooks retain native trust requirements.
+        # Trust only this disposable test project's config layer for native MCP discovery.
+        assert not (repo / ".agents/skills/agent-sync-config").exists()
+        assert not (home / ".codex/skills/global-review").exists()
+        assert (repo / ".claude/skills/review-code").resolve() == repo / ".agents/skills/review-code"
         config = home / ".codex/config.toml"
         config.write_text((config.read_text() if config.exists() else "") +
                           "\n[projects." + json.dumps(str(repo)) + ']\ntrust_level = "trusted"\n')
@@ -146,7 +148,7 @@ def main():
             assert "local-probe" in native and sys.executable in native, native
             global_native = run([args.claude, "mcp", "get", "global-probe"], env, repo)
             assert "global-probe" in global_native and sys.executable in global_native, global_native
-            report["claude"] = {"project_and_global_mcp_config_loading": "passed", "interactive_skill_and_hooks": "manual verification required",
+            report["claude"] = {"project_and_global_mcp_config_loading": "passed", "claude_skill_references": "verified on disk",
                                 "model_turn": "not requested"}
         else:
             report["claude"] = "not installed"

@@ -14,14 +14,15 @@ Each adapter must establish:
 - Project/global instruction discovery, precedence, imports, and nested scopes.
 - Skill discovery, invocation, symlink support, and duplicate handling.
 - Native MCP paths, transports, environment syntax, and credential boundaries.
-- Session/resume/prompt hooks, output contracts, trust, and read-only behavior.
+- Native instruction refresh on session/resume, imports, and read-only behavior.
 - Personal defaults and local versus remote/cloud filesystem availability.
 
 Verify fresh and existing repositories, repeat runs, conflicts, actual resource
 discovery, native MCP loading, client switching, fresh/resumed sessions, read-only
-behavior, and warm-check latency. Record tested versions and report each
+behavior, and explicit check performance. Record tested versions and report each
 capability separately.
 
-Sharing files does not guarantee identical hook enforcement, plugin behavior,
-or model compliance. A client without prompt hooks may require an explicit check
-or startup wrapper; document that limitation. Plugins remain provider-managed.
+Sharing files does not guarantee identical plugin behavior or model compliance.
+Adapters should establish shared references without bundling the synchronizer
+into projects or adding automatic hooks. Repairs and MCP rendering use explicit
+checks/syncs. Plugins remain provider-managed.

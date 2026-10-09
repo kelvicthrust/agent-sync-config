@@ -2,13 +2,14 @@
 
 [![skills.sh](https://skills.sh/b/kelvicthrust/agent-sync-config)](https://skills.sh/kelvicthrust/agent-sync-config)
 
-Share local agent instructions, skills, curated context, and MCP definitions
-across Codex and Claude Code. One repeatable command initializes a new repository
-or reconciles an existing one, while preserving conflicting content.
+Use the same project instructions and skills in Codex and Claude Code through
+shared files and links. Install the skill once on your machine, then run it to
+set up or check a project or your global configuration. Existing conflicting
+content is preserved. Curated context and MCP configuration are also supported.
 
-**[v0.3.0 preview](https://github.com/kelvicthrust/agent-sync-config/tree/v0.3.0).** Initial support targets macOS/Linux with Python 3.11+ and
+**[v0.4.0 preview](https://github.com/kelvicthrust/agent-sync-config/releases/tag/v0.4.0).** Supports macOS/Linux with Python 3.11+ and
 local Codex/Claude Code clients. Ensure `python3` resolves to Python 3.11+ in
-the terminal and native hook environment. See [testing and compatibility](docs/testing.md)
+the terminal environment. See [testing and compatibility](docs/testing.md)
 for verified capabilities and limits.
 
 ## Install once
@@ -21,16 +22,15 @@ npx skills add kelvicthrust/agent-sync-config \
   --skill agent-sync-config --global --agent codex claude-code
 ```
 
-To install the fixed v0.3.0 preview:
+To pin installation to v0.4.0:
 
 ```sh
-npx skills add https://github.com/kelvicthrust/agent-sync-config/tree/v0.3.0 \
+npx skills add https://github.com/kelvicthrust/agent-sync-config/tree/v0.4.0 \
   --skill agent-sync-config --global --agent codex claude-code
 ```
 
-See [upgrading to 0.3.0](#upgrade-to-the-030-lifecycle-behavior) for migration steps.
-The unversioned command above follows the repository's default branch;
-creating a version tag does not change that source.
+The unversioned command follows the repository's default branch; the pinned
+command installs the tagged version.
 
 For a local checkout, replace `kelvicthrust/agent-sync-config` with its absolute
 path. `--global` here installs the **skill** for discovery in any project. It does
@@ -50,10 +50,8 @@ Use the same skill in either client:
 | Codex CLI/IDE | `$agent-sync-config` |
 | Codex desktop | Type `@` and select `agent-sync-config` |
 
-If Codex lists both project and global copies, select the project copy from its
-skill picker for local work. In a noninteractive Codex request, an explicit
-`[$agent-sync-config](/absolute/project/.agents/skills/agent-sync-config/SKILL.md)`
-reference disambiguates the copy. Both copies enforce the same scope rules.
+The setup skill stays installed on your machine; project setup does not copy it
+into the repository. Its installation location never selects execution scope.
 
 The skill runs its bundled Python script, so the terminal command does not have
 to be installed first. Add your intention to the request, for example
@@ -75,7 +73,7 @@ Codex and Claude resources from it. Conflicting existing content is preserved an
 reported. Provider-only settings, plugins, credentials, history, and automatic
 memory stay provider-managed; they are not all interchangeable.
 
-Global setup installs `~/.local/bin/agent-sync-config` and global audit-only hooks.
+Global setup installs `~/.local/bin/agent-sync-config` without automatic hooks.
 Add `~/.local/bin` to your PATH if needed. After that, from any directory:
 
 ```sh
@@ -85,7 +83,8 @@ agent-sync-config check --scope global  # audit personal resources without write
 
 Global operations do not read, initialize, or reconcile the current project's
 configuration. Edit `~/agent-config/AGENTS.md`, `skills/`, or `mcp.json`, then run
-explicit global sync when needed. Global hooks can report drift but never repair it.
+explicit global sync to adopt new skills, repair references, or render MCP changes.
+Edits to existing instructions and skills are already shared through their links.
 
 ## Apply it to a project
 
@@ -108,7 +107,14 @@ agent-sync-config --scope project        # initialize or sync this project
 agent-sync-config check --scope project  # audit this project without writes
 ```
 
-Or from a local checkout before installing a terminal wrapper:
+Without the terminal wrapper, use the installed skill's script directly:
+
+```sh
+python3 ~/.agents/skills/agent-sync-config/scripts/agent_sync_config.py \
+  --scope project --project /path/to/your-repo
+```
+
+Or run from a local checkout:
 
 ```sh
 ./bin/agent-sync-config --scope project --project /path/to/your-repo
@@ -117,16 +123,16 @@ Or from a local checkout before installing a terminal wrapper:
 
 Edit project instructions in `AGENTS.md`, skills in `.agents/skills/`, curated
 context in `.agents/context/`, and MCP definitions in `.agents/mcp.json`. Both
-clients use those canonical resources. Repeat the same project command after
-changes or when a hook reports drift. The managed section in AGENTS.md explains
-when to invoke the skill; project setup includes its runtime and licenses.
+clients use those canonical resources. Ordinary instruction and skill edits are
+shared immediately through references; no background synchronization is needed.
+Run the skill again to adopt a new provider skill, repair a missing link, reconcile
+conflicts, or regenerate native MCP configuration after changing its definitions.
 
-Setup installs SessionStart/UserPromptSubmit hooks in the project. Review Codex
-hooks through `/hooks`; restart Claude Code after initial installation. Native
-trust, permissions, and disabled-hook controls still apply. When switching clients,
-a trusted project hook checks the local resources before continuing. Run the
-skill/check explicitly if hooks are disabled, untrusted, or report drift. The tested
-Codex payloads lack sandbox policy, so their hooks audit and explicit sync repairs.
+Project setup creates configuration, relative links, and a small ownership
+manifest. It installs no setup skill, Python runtime, dependencies, or automatic
+hooks inside the project. Each machine needs the skill installed to run setup or
+checks; existing references remain usable without the tool. The managed section
+in AGENTS.md explains where to edit shared resources and when to invoke the skill.
 
 ## Scope rules and reports
 
@@ -147,7 +153,7 @@ cannot be project targets.
 `check` is strictly read-only, including runtime state. Reports include the resolved
 scope; global reports have no project target. Exit codes: `0` success, `1` conflicts
 or read-only drift, `2` invalid configuration, missing scope selection, lock
-contention, or filesystem error. Use `--json` for structured reports.
+contention, missing cleanup confirmation, or filesystem error. Use `--json` for structured reports.
 
 The tool never stages files, commits, or pushes. Individual configuration writes
 are atomic; the overall operation is not a transaction. Nonconflicting changes
@@ -163,30 +169,25 @@ your-project/
 ├── AGENTS.md                 # shared project instructions + managed guidance
 ├── CLAUDE.md                 # @AGENTS.md
 ├── .agents/
-│   ├── agent-sync.json       # layout version, managed links, last rendered MCP
+│   ├── agent-sync.json       # small ownership/MCP reconciliation manifest
 │   ├── context/              # curated project docs
-│   └── skills/
-│       └── agent-sync-config/ # packaged setup skill, runtime, licenses
-├── .claude/
-│   ├── settings.json         # merged project hooks
-│   └── skills/               # per-skill relative links
-└── .codex/
-    └── hooks.json            # merged project hooks
+│   └── skills/               # your project skills; no tool runtime
+└── .claude/
+    └── skills/               # per-skill relative links
 ```
 
-The context folder stays empty until you add resources or setup adopts existing
-ones; Git does not track empty folders. The packaged setup runtime allows project
-hooks to work after relocation or cloning, including nested directories and
-worktrees, without a fixed machine path. With another project skill:
+Context and skill folders stay empty until you add resources or setup adopts
+existing ones; Git does not track empty folders. With a project skill:
 
 ```text
 .agents/skills/review-code/SKILL.md
 .claude/skills/review-code -> ../../.agents/skills/review-code
 ```
 
-Codex reads `.agents/skills/` directly. Setup also adopts an existing legacy
-`.codex/skills/` directory and maintains its per-skill links, but does not create
-that duplicate directory in a fresh project.
+Codex reads `.agents/skills/` directly; Claude reads the same files through these
+links. The relative links work after relocation or cloning. Setup uses a single
+Codex skill entrypoint in each scope and preserves unowned or modified resources
+and system skills.
 
 Existing curated `.claude/context/` and `.codex/context/` content can be adopted
 into `.agents/context/`. After conflict-free adoption, those existing directories
@@ -202,8 +203,7 @@ If shared MCP servers are configured, setup adds:
 ```
 
 Commit project instructions, canonical resources, the project manifest, relative
-links, project hooks, the packaged setup runtime/licenses, and nonsecret generated
-MCP configuration. Personal defaults, credentials, backups, and runtime cache remain outside the project.
+links, and nonsecret generated MCP configuration. Personal defaults, credentials, and private backups remain outside the project.
 
 ## Instructions and existing resources
 
@@ -219,8 +219,8 @@ import wrapper and rerun. Existing AGENTS.override.md files are reported because
 they can mask shared instructions. Linked instruction sources and external skill
 dependencies require explicit reconciliation rather than forced replacement.
 
-Setup verifies the installed skill's entrypoints. A reference inside AGENTS.md
-does not install a skill or guarantee that a model follows it.
+A reference inside AGENTS.md does not install the machine skill or guarantee
+that a model follows it.
 
 ## Personal defaults
 
@@ -245,7 +245,7 @@ not assumed to have already been synchronized.
 
 Version personal instructions, skills, and nonsecret MCP definitions separately
 from this tool's repository. Keep `.agent-sync.json` machine-local. Runtime
-registration, metadata cache, synchronization lock, and private backups live in
+registration, synchronization lock, and private backups live in
 `~/.local/state/agent-sync-config/`.
 
 ## Remove a shared global skill
@@ -282,8 +282,8 @@ When a previously managed entrypoint or observed installation record disappears,
 interactive global sync offers **complete removal**, **restore installation**,
 or **cancel**. Until you choose, it leaves that skill's shared source in place
 and stops recreating its links. Removing only one provider entrypoint also asks
-for a decision; separate provider exclusions are not supported. Hooks and
-read-only checks report the pending decision without changing personal files.
+for a decision; separate provider exclusions are not supported. Read-only checks
+report the pending decision without changing personal files.
 JSON/noninteractive sync returns exit code `1`; `--yes` does not select removal
 or restoration. Unrelated resources may still synchronize.
 
@@ -303,12 +303,12 @@ agent-sync-config uninstall --scope global
 ```
 
 This turns owned global instruction links into ordinary files, preserves remaining
-skills as ordinary directories in `~/.agents/skills`, and points Claude and any
-existing legacy Codex skill links there. Native MCP definitions remain in place.
-It removes only owned global hooks, the terminal wrapper, the setup skill, and
-global registration/cache entries. Project configuration and registration,
+skills as ordinary directories in `~/.agents/skills`, and points Claude skill
+links there. Native MCP definitions remain in place. It removes the terminal
+wrapper, setup skill, global registration, and any other recorded unchanged
+integration artifacts. Project configuration and registration,
 unrelated settings/hooks/plugins, system skills, and private backups stay intact.
-Restart clients after uninstalling to refresh their discovery and hooks.
+Restart clients after uninstalling to refresh their discovery.
 
 By default, retained personal sources have a detached manifest and no active
 global synchronization. To also delete the redundant owned shared sources,
@@ -343,71 +343,16 @@ global update reconciliation are separate work. Avoid unrestricted
 directory overlaps another client's installation directory. Our lifecycle
 commands target recorded global resources and leave the publisher checkout alone.
 
-## Upgrade to the 0.3.0 lifecycle behavior
+## When to run sync
 
-Install the updated skill and run its updated bundled script once to record
-ownership, upgrade the global runtime, and refresh the terminal wrapper:
+Edits to shared instructions and skills are visible through their references
+immediately. Run the skill or scoped sync command when you add a provider skill,
+need to repair references, reconcile a conflict, or render changed MCP definitions.
+Use scoped `check` commands to audit without modifying files.
 
-```sh
-python3 ~/.agents/skills/agent-sync-config/scripts/agent_sync_config.py --scope global
-agent-sync-config --version  # should report 0.3.0
-```
-
-From this local checkout, use `./bin/agent-sync-config --scope global` instead.
-Use the updated script/skill for this first upgrade; an existing terminal wrapper
-may still execute 0.2.0. Existing missing entrypoints are reported for a decision
-rather than repaired automatically. Audits interpret older
-manifests without writing an upgrade. Review native hook trust and restart clients
-when updating the runtime. The v0.3.0 tag includes these lifecycle commands;
-the older v0.2.0 tag does not.
-
-## Automatic checks and limits
-
-Project and global SessionStart/UserPromptSubmit hooks run separate scoped checks.
-Project hooks use the repository runtime; global hooks audit personal resources
-independently of the current project. Healthy warm prompt checks are silent.
-New/resumed sessions and changed instructions receive a reminder to read current
-guidance. Only project hooks can repair, subject to native permissions.
-
-The warm path uses directory entries, stat/readlink metadata, and a cached
-fingerprint. It does not traverse project source code, run git diff, download
-packages, or contact providers. Changed MCP configuration is parsed semantically.
-
-**Claude Code project hooks:** recognized writable prompt modes can repair
-missing managed links, remove unchanged obsolete links, and render unambiguous shared MCP changes.
-Planning mode and unknown permission modes only report required repairs.
-
-**Codex:** tested versions 0.142.0, 0.160.0, and 0.162.0-alpha.2 omit sandbox
-policy in the hook payload. They can report `bypassPermissions` even with a read-only sandbox.
-Hooks therefore audit and report drift by default. They repair only when a payload explicitly
-identifies a writable sandbox. Run the skill/tool to reconcile drift when edits
-are allowed; do not interpret a hook's permission mode alone as write access.
-
-Hooks never install or upgrade the tool automatically, recreate missing shared
-instructions, or overwrite conflicting content. Locks, registration, metadata
-caches, and private backups live outside projects.
-Runtime state is the only permitted outside-project write during project operations;
-personal/provider configuration stays unchanged. Metadata caching is allowed
-during hook audits; set `AGENT_SYNC_READ_ONLY=1` for strict
-no-cache/no-repair hook execution. CLI `check` is always read-only.
-
-Native trust, disabled hooks, safe modes, managed policies, and client flags can
-prevent hook execution. Setup preserves these controls and explains the native
-trust step; file presence cannot prove hooks are enabled. MCP changes may require
-server reconnection or a client restart. No hot-reload guarantee is made.
-
-## Upgrading from 0.1.0
-
-Install the updated skill, then explicitly request global sync once (or run its
-updated bundled script with `--scope global`). This upgrades the installed global
-runtime and replaces owned legacy global handlers with audit-only handlers.
-Review changed Codex hook trust and restart clients as needed.
-
-Project setup reports a required legacy global upgrade but leaves it untouched.
-Old registry entries that allowed combined synchronization do not authorize the
-new engine to modify personal configuration. Until explicitly upgraded, old
-installed global handlers can still run the old combined behavior. Then run
-project setup in each repository to package its runtime and install local hooks.
+There are no automatic prompt checks, repairs, or synchronizer hook-trust requests.
+MCP changes may require server reconnection or a client restart. Other tools'
+hooks, native trust controls, and provider-specific settings remain independent.
 
 ## MCP and plugins
 
@@ -453,11 +398,9 @@ are not implemented. Desktop GUI and cloud behavior have not been verified.
 
 - [Codex instructions](https://learn.chatgpt.com/docs/agent-configuration/agents-md),
   [skills](https://learn.chatgpt.com/docs/build-skills),
-  [hooks](https://learn.chatgpt.com/docs/hooks),
   [MCP](https://learn.chatgpt.com/docs/extend/mcp?surface=cli).
 - [Claude instructions](https://code.claude.com/docs/en/memory),
   [skills](https://code.claude.com/docs/en/skills),
-  [hooks](https://code.claude.com/docs/en/hooks),
   [MCP](https://code.claude.com/docs/en/mcp).
 
 MIT licensed; the license also travels with the installed skill. The skill bundles
