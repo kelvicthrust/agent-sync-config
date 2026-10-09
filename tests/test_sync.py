@@ -254,7 +254,9 @@ class ConfigurationTests(unittest.TestCase):
         shutil.rmtree(skill)
         self.hook(provider="claude", scope="global")
         self.assertTrue((self.home / ".agents/skills/review-code").is_symlink())
-        self.run_tool(scope="global")
+        report = self.run_tool(expected=1, scope="global")
+        self.assertIn("review-code", report["pending_removals"])
+        self.run_tool("remove-skill", "review-code", "--yes", scope="global")
         self.assertFalse(os.path.lexists(self.home / ".agents/skills/review-code"))
 
     def test_mcp_removal_preserves_modified_and_unmanaged_servers(self):
@@ -338,14 +340,15 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual(json.loads(project_plugin.read_text())["enabledPlugins"], {"project@example": True})
         self.assertEqual(self.run_tool()["changes"], [])
 
-    def test_missing_global_skill_requires_explicit_global_sync(self):
+    def test_missing_global_skill_requires_explicit_removal_decision(self):
         self.run_tool(scope="global")
         (self.home / ".claude/skills/agent-sync-config").unlink()
         self.run_tool("check", expected=1, scope="global")
         self.hook(provider="claude", scope="global")
         self.assertFalse((self.home / ".claude/skills/agent-sync-config").exists())
-        self.run_tool(scope="global")
-        self.run_tool("check", scope="global")
+        report = self.run_tool(expected=1, scope="global")
+        self.assertIn("agent-sync-config", report["pending_removals"])
+        self.assertFalse((self.home / ".claude/skills/agent-sync-config").exists())
 
     def test_hooks_normal_plan_unknown_mode_and_read_only_sandbox(self):
         self.skill(".agents/skills/review-code")
@@ -619,6 +622,7 @@ class ConfigurationTests(unittest.TestCase):
         (self.home / ".claude/skills/agent-sync-config").unlink()
         self.hook(provider="claude")
         self.assertFalse((self.home / ".claude/skills/agent-sync-config").exists())
+        (self.home / ".claude/skills/agent-sync-config").symlink_to("../../agent-config/skills/agent-sync-config")
         self.run_tool(scope="global")
         registry = json.loads(registry_path.read_text())
         self.assertTrue(registry["global_hooks_audit_only"])

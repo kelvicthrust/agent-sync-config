@@ -118,7 +118,7 @@ def main():
                    "DO_NOT_TRACK": "1", "DISABLE_TELEMETRY": "1", "DISABLE_AUTOUPDATER": "1",
                    "ANTHROPIC_API_KEY": "fixture-not-a-secret", "ANTHROPIC_BASE_URL": endpoint,
                    "AGENT_SYNC_FIXTURE_KEY": "fixture-not-a-secret"}
-            for key in ("ANTHROPIC_AUTH_TOKEN", "OPENAI_API_KEY", "CLAUDE_CONFIG_DIR"):
+            for key in ("ANTHROPIC_AUTH_TOKEN", "OPENAI_API_KEY", "CLAUDE_CONFIG_DIR", "XDG_STATE_HOME"):
                 env.pop(key, None)
             subprocess.run(["git", "init", "-q", str(repo)], check=True)
             (repo / "AGENTS.md").write_text("PROJECT_INSTRUCTIONS_SENTINEL\n")

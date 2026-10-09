@@ -6,7 +6,7 @@ Share local agent instructions, skills, curated context, and MCP definitions
 across Codex and Claude Code. One repeatable command initializes a new repository
 or reconciles an existing one, while preserving conflicting content.
 
-**v0.2.0 preview.** Initial support targets macOS/Linux with Python 3.11+ and
+**v0.3.0 preview (not yet released).** Initial support targets macOS/Linux with Python 3.11+ and
 local Codex/Claude Code clients. Ensure `python3` resolves to Python 3.11+ in
 the terminal and native hook environment. See [testing and compatibility](docs/testing.md)
 for verified capabilities and limits.
@@ -21,7 +21,7 @@ npx skills add kelvicthrust/agent-sync-config \
   --skill agent-sync-config --global --agent codex claude-code
 ```
 
-To install the fixed v0.2.0 preview rather than the repository's default branch:
+To install the previously released v0.2.0 preview (without the lifecycle commands below):
 
 ```sh
 npx skills add https://github.com/kelvicthrust/agent-sync-config/tree/v0.2.0 \
@@ -247,6 +247,119 @@ Version personal instructions, skills, and nonsecret MCP definitions separately
 from this tool's repository. Keep `.agent-sync.json` machine-local. Runtime
 registration, metadata cache, synchronization lock, and private backups live in
 `~/.local/state/agent-sync-config/`.
+
+## Remove a shared global skill
+
+Use the synchronizer for immediate removal of both the shared source and its
+owned installations:
+
+```sh
+agent-sync-config remove-skill review-code --scope global --dry-run
+agent-sync-config remove-skill review-code --scope global
+```
+
+The second command lists the affected paths and asks for confirmation. For an
+explicit cleanup in a script, add `--yes`; `--json` alone does not confirm it.
+Removal deletes the recorded source under the personal `skills/` directory,
+unchanged managed entrypoints, and its matching Skills CLI lock entry. Modified
+sources, redirected links, conflicting copies, and changed installation records
+block cleanup and remain untouched. Synchronize intentional source edits first
+to accept their current content, then review removal again.
+
+An intentional removal is recorded in `.agent-sync.json`, so future syncs do not
+adopt leftover provider copies. Explicit `--import-skill /path/to/skill` adoption
+can reinstall it. A new installation through `npx skills add` is reported for
+acceptance rather than silently adopted.
+
+You can still remove an installed skill through the Skills CLI:
+
+```sh
+npx skills remove review-code --global --agent codex claude-code
+agent-sync-config --scope global
+```
+
+When a previously managed entrypoint or observed installation record disappears,
+interactive global sync offers **complete removal**, **restore installation**,
+or **cancel**. Until you choose, it leaves that skill's shared source in place
+and stops recreating its links. Removing only one provider entrypoint also asks
+for a decision; separate provider exclusions are not supported. Hooks and
+read-only checks report the pending decision without changing personal files.
+JSON/noninteractive sync returns exit code `1`; `--yes` does not select removal
+or restoration. Unrelated resources may still synchronize.
+
+The Skills CLI has no callback into this tool. Direct `npx skills remove` therefore
+needs this later reconciliation; it cannot immediately clean our shared source.
+A no-op CLI removal that finds no installed skill is not treated as a removal.
+Skills CLI metadata integration currently supports version 3 lockfiles (tested
+with CLI 1.7.1). Unsupported or malformed lockfiles are reported and preserved.
+
+## Uninstall global synchronization
+
+Remove the integration while keeping your remaining configuration usable:
+
+```sh
+agent-sync-config uninstall --scope global --dry-run
+agent-sync-config uninstall --scope global
+```
+
+This turns owned global instruction links into ordinary files, preserves remaining
+skills as ordinary directories in `~/.agents/skills`, and points Claude and any
+existing legacy Codex skill links there. Native MCP definitions remain in place.
+It removes only owned global hooks, the terminal wrapper, the setup skill, and
+global registration/cache entries. Project configuration and registration,
+unrelated settings/hooks/plugins, system skills, and private backups stay intact.
+Restart clients after uninstalling to refresh their discovery and hooks.
+
+By default, retained personal sources have a detached manifest and no active
+global synchronization. To also delete the redundant owned shared sources,
+choose the purge option on the uninstall command:
+
+```sh
+agent-sync-config uninstall --scope global --purge-shared-sources --dry-run
+agent-sync-config uninstall --scope global --purge-shared-sources
+```
+
+Purge verifies the native replacements before deleting owned shared sources.
+It preserves unrelated files and version-control data in the personal directory
+and removes directories only when empty. It is not secure erasure: private
+backups remain available. Conflicts, dependency symlinks, or nested private version-control data block
+uninstall/purge before changes when native preservation or deletion is unsafe.
+An interrupted uninstall can be retried from another installed copy or this
+checkout, using the same purge choice and home; ownership recovery is retained
+until cleanup finishes. Removing `agent-sync-config` with `remove-skill` directs
+you to `uninstall` instead.
+
+If you already uninstalled without purge, the terminal wrapper is gone. Run the
+bundled script from this checkout to clean retained sources afterward:
+
+```sh
+python3 skills/agent-sync-config/scripts/agent_sync_config.py \
+  uninstall --scope global --purge-shared-sources
+```
+
+Lifecycle commands currently support global scope only. Project uninstall and
+global update reconciliation are separate work. Avoid unrestricted
+`npx skills remove` inside this publisher repository: its shipped `skills/`
+directory overlaps another client's installation directory. Our lifecycle
+commands target recorded global resources and leave the publisher checkout alone.
+
+## Upgrade to the 0.3.0 lifecycle behavior
+
+Install the updated skill and run its updated bundled script once to record
+ownership, upgrade the global runtime, and refresh the terminal wrapper:
+
+```sh
+python3 ~/.agents/skills/agent-sync-config/scripts/agent_sync_config.py --scope global
+agent-sync-config --version  # should report 0.3.0
+```
+
+From this local checkout, use `./bin/agent-sync-config --scope global` instead.
+Use the updated script/skill for this first upgrade; an existing terminal wrapper
+may still execute 0.2.0. Existing missing entrypoints are reported for a decision
+rather than repaired automatically. Audits interpret older
+manifests without writing an upgrade. Review native hook trust and restart clients
+when updating the runtime. This checkout is the 0.3.0 preview; the published
+v0.2.0 tag does not contain these lifecycle commands.
 
 ## Automatic checks and limits
 

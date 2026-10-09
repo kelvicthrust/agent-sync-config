@@ -17,10 +17,13 @@ and ownership, native settings/plugin preservation, malformed inputs, read-only
 behavior, hooks, and cache invalidation. Scope tests cover first-run selection,
 cancellation, marker detection, argument conflicts, protected targets, snapshots
 of the opposite scope, relocation/worktrees, ownership, legacy upgrade, and
-audit-only global hooks. It does not use model credentials or
+audit-only global hooks. Global lifecycle tests cover ownership migration,
+confirmed removal, cancellation, tombstones/reinstallation, external removal
+decisions, lockfile preservation, native materialization, purge, conflicting
+artifacts, detached setup, custom roots, and interrupted uninstall recovery. It does not use model credentials or
 contact model providers.
 
-The benchmark measures warm metadata checks, including Python startup. It reports
+The benchmark measures project and global warm metadata checks, including Python startup. It reports
 a 100 ms target without making scheduling-dependent timings a CI failure.
 Results depend on the host and filesystem.
 
@@ -56,8 +59,10 @@ the native clients' authentication or configuration directories.
 
 For adoption tests, start a separate fixture with existing CLAUDE.md, provider
 skills, or nonsecret MCP definitions. Conflicting instruction or skill contents
-must remain preserved and be reported. Remove a managed skill link: `check`
-should report drift without writing files, and explicit sync should restore it.
+must remain preserved and be reported. Remove a managed project skill link: `check`
+should report drift without writing files, and explicit project sync should restore it.
+For a global skill, missing links instead require an explicit removal/restoration
+decision; checks/hooks and noninteractive sync never silently recreate them.
 Keep an application file in the fixture and confirm it remains unchanged.
 
 ## Native discovery and installation
@@ -143,11 +148,13 @@ inspect native trust status, fixture hook logs/state, tool calls, and file chang
 
 | Environment | Verification |
 | --- | --- |
+| Codex 0.162.0 on macOS | 0.3.0 native discovery before/after global uninstall and protocol-stub sessions; no authenticated model turn |
 | Codex 0.162.0-alpha.2 on macOS | 0.2.0 native discovery and protocol-stub sessions; authenticated trusted project hooks, drift reporting, explicit project repair/check, and fresh/resumed instruction loading |
 | Codex 0.160.0 on macOS | Previous 0.1.0 authenticated native CLI/app-server pilot: setup/adoption, explicit repair, checks, local MCP tool call, trusted hooks, drift reporting, and fresh/resumed instruction loading |
 | Codex 0.142.0 on macOS | Native discovery/parsing and protocol-stub sessions; authenticated model compatibility is not established |
 | Claude Code 2.1.295 on macOS | Native MCP loading and protocol-stub sessions, hooks, resume refresh, planning behavior, and writable repair; authenticated model compliance is not established |
-| Python 3.12.14 on macOS | 54 automated tests passed; portable warm hook with 30 skills: 56 ms median / 60 ms p95 in a local sample |
+| Python 3.12.14 on macOS | 76 automated tests passed; 30-skill warm hooks: project 61 ms median / 65 ms p95, global 54 ms median / 58 ms p95 in a local sample |
+| Skills CLI 1.7.1 on macOS | Local installation, no-op/partial/complete global removal, reinstallation acceptance, and installed-runtime self-uninstall |
 | Python 3.14.8 on macOS | Automated scope tests and benchmark also exercised during development |
 | Python 3.11/3.13 on macOS/Linux | CI targets; consult actual workflow results |
 
@@ -159,3 +166,22 @@ The tested Codex hook payloads omit sandbox policy and may report
 repair requires explicit skill sync unless a payload identifies a writable
 sandbox. Claude planning/unknown modes also audit. Disabled or untrusted hooks
 and native policies can prevent checks; model compliance is not guaranteed.
+
+## Skills CLI lifecycle integration
+
+```sh
+python3 tests/skills_lifecycle.py --skills-cli /path/to/skills/bin/cli.mjs --node /path/to/node
+```
+
+This uses the actual Skills CLI in disposable homes to verify no-op removal,
+partial-provider removal, complete global removal, setup-skill removal, and
+reinstallation acceptance. It installs from local fixtures without model
+credentials or telemetry. The script reports the CLI version under test.
+Never run removal integration tests from the publisher checkout itself.
+
+Lifecycle dry runs and refusal/cancellation must leave the entire fixture
+unchanged, including locks and caches. After uninstall, native discovery should
+find remaining skills and no setup skill, global hooks should contain only
+unrelated handlers, and native MCP content should be unchanged. Purge must remove
+only owned shared sources after native preservation. The automated suite injects
+an interruption after source/runtime removal and verifies retry completion.

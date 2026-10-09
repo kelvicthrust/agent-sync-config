@@ -1,6 +1,6 @@
 ---
 name: agent-sync-config
-description: Set up, check, or synchronize shared instructions, skills, curated project context, and MCP configuration across Codex and Claude Code. Use for a new repository, configuration drift, a client switch, or an explicit global configuration request.
+description: Set up, check, or synchronize shared instructions, skills, curated project context, and MCP configuration across Codex and Claude Code. Use for a new repository, configuration drift, a client switch, an explicit global configuration request, or removing/uninstalling shared global skills.
 ---
 
 # Agent Sync Config
@@ -82,3 +82,38 @@ Portable resources from plugins require explicit adoption with `--import-skill`
 or `--import-mcp` into the selected scope; resolve dependencies first. The tool
 does not install, update, or translate plugins. Additional clients require tested
 integrations; initial support is local Codex and Claude Code.
+
+## Remove global skills or uninstall
+
+Global lifecycle commands require explicit `--scope global`. Preview concrete
+paths before cleanup, then honor the user's removal/uninstall request:
+
+```sh
+python3 <skill-directory>/scripts/agent_sync_config.py remove-skill <name> --scope global --dry-run --json
+python3 <skill-directory>/scripts/agent_sync_config.py remove-skill <name> --scope global --yes --json
+python3 <skill-directory>/scripts/agent_sync_config.py uninstall --scope global --dry-run --json
+python3 <skill-directory>/scripts/agent_sync_config.py uninstall --scope global --yes --json
+```
+
+`--yes` confirms the specified cleanup; use it when the user already authorized
+that operation. It does not decide ambiguous external removals. To delete
+redundant owned personal sources after preserving native configuration, add
+`--purge-shared-sources` to uninstall only when requested. Uninstall preserves
+native instructions, remaining skills, MCP settings, unrelated hooks, and projects.
+It removes the owned setup skill, global handlers, wrapper, and registration.
+Use uninstall rather than remove-skill for agent-sync-config itself.
+
+Direct `npx skills remove --global` cannot delete our retained personal source.
+A later sync/check reports `pending_removals` and suppresses reinstallation.
+For a reported removal, ask whether to complete removal, restore the installation,
+or cancel. Complete ordinary removal with remove-skill; complete setup-skill
+removal with uninstall. For restoration, run interactive terminal sync when
+available, or explicitly import the retained shared skill source after the user
+chooses restoration. A reported reinstall can be accepted through explicit
+--import-skill adoption from its new ordinary source. Never infer the answer
+from --yes or a missing file. Hooks/check stay audit-only for global resources.
+
+Conflicts block deletion. Preserve them and explain the paths requiring
+reconciliation. An interrupted uninstall keeps recovery metadata; retry with
+the original purge choice from another runtime or checkout. Private backups
+remain available; purge is not secure erasure.

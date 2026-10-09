@@ -19,7 +19,7 @@ from contextlib import contextmanager
 
 sys.dont_write_bytecode = True
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 NAME = "agent-sync-config"
 SCHEMA = 1
 SKILL = Path(__file__).resolve().parents[1]
@@ -342,11 +342,16 @@ class Sync:
         self.registry = read_json(self.registry_path, {"schema": SCHEMA, "projects": {}})
         if self.registry.get("schema") != SCHEMA or not isinstance(self.registry.get("projects"), dict):
             raise ConfigError("Unsupported machine registry")
-        registered = self.registry.get("personal_root")
+        recovery = self.registry.get("global_uninstall", {})
+        if not isinstance(recovery, dict):
+            raise ConfigError("Invalid global uninstall recovery state")
+        registered = self.registry.get("personal_root") or recovery.get("personal_root")
         if personal and registered and personal.resolve() != Path(registered).resolve():
             raise ConfigError("Personal root already registered; migrate it explicitly rather than creating a second source")
         self.personal = personal or (Path(registered) if registered else home / "agent-config")
         self.personal = self.personal.expanduser().resolve()
+        self.restoring: set[str] = set()
+        self.pending_removals: dict = {}
         self.issues: list[str] = []
         self.changes: list[str] = []
         self.notes: list[str] = []
@@ -365,6 +370,9 @@ class Sync:
 
     def safe_parent(self, path: Path):
         allowed = (self.root, self.state_dir) if self.scope == "project" else (self.personal, self.home)
+        xdg = os.environ.get("XDG_STATE_HOME")
+        if self.scope == "global" and xdg and self.home == Path.home().resolve() and Path(xdg).is_absolute():
+            allowed += (Path(xdg).expanduser() / "skills",)
         bases = sorted(allowed, key=lambda item: len(item.parts), reverse=True)
         for base in bases:
             if path.is_relative_to(base):
@@ -441,7 +449,9 @@ class Sync:
         desired = os.path.relpath(source, target.parent)
         if target.is_symlink():
             if target.resolve() == source.resolve():
-                records[key] = desired
+                # Keep the actual spelling for ownership: Skills CLI often
+                # routes Claude through .agents rather than directly to source.
+                records[key] = os.readlink(target)
                 return
             self.issue(f"Conflicting symlink (preserved): {target}")
             return
@@ -505,14 +515,15 @@ class Sync:
         if exists(self.root / "AGENTS.override.md"):
             self.issue("AGENTS.override.md masks shared root instructions in Codex; reconcile it explicitly")
 
-    def skills(self, canonical: Path, targets: list[Path], records: dict, base: Path):
+    def skills(self, canonical: Path, targets: list[Path], records: dict, base: Path, blocked=None):
+        blocked = blocked or set()
         self.mkdir(canonical)
         for target_dir in targets:
             self.mkdir(target_dir)
             if not target_dir.is_dir() or target_dir.is_symlink():
                 continue
             for item in sorted(target_dir.iterdir()):
-                if item.name.startswith(".") or not (item / "SKILL.md").is_file():
+                if item.name in blocked or item.name.startswith(".") or not (item / "SKILL.md").is_file():
                     continue
                 source = canonical / item.name
                 if not exists(source):
@@ -531,7 +542,7 @@ class Sync:
             return
         wanted = {}
         for source in sorted(canonical.iterdir()):
-            if source.name.startswith("."):
+            if source.name in blocked or source.name.startswith("."):
                 continue
             if not SKILL_NAME.fullmatch(source.name):
                 self.issue(f"Invalid shared skill directory name: {source}")
@@ -549,7 +560,7 @@ class Sync:
         # Remove only links that we owned and that still point to the recorded source.
         prefixes = [str(target.relative_to(base)) + "/" for target in targets]
         for key, previous in list(records.items()):
-            if key in wanted or not any(key.startswith(prefix) for prefix in prefixes):
+            if Path(key).name in blocked or key in wanted or not any(key.startswith(prefix) for prefix in prefixes):
                 continue
             target = base / key
             if target.is_symlink() and os.readlink(target) == previous:
@@ -793,12 +804,539 @@ class Sync:
             state.setdefault("tool_digest", source_hash)
         return target
 
-    def personal_setup(self, imported_skill=None, imported_mcp=None):
-        personal_manifest_path = self.personal / ".agent-sync.json"
-        state = read_json(personal_manifest_path, {"schema": SCHEMA, "links": {}, "mcp": {}})
+    def skill_link_values(self, name, target):
+        source = self.personal / "skills" / name
+        values = {str(source), os.path.relpath(source, target.parent)}
+        native = self.home / ".agents/skills" / name
+        if target != native:
+            values |= {str(native), os.path.relpath(native, target.parent)}
+        return values
+
+    def personal_state(self):
+        recovery = self.registry.get("global_uninstall", {})
+        default = recovery.get("state", {"schema": SCHEMA, "links": {}, "mcp": {}})
+        state = read_json(self.personal / ".agent-sync.json", default)
         if state.get("schema") != SCHEMA or not isinstance(state.get("links"), dict) or not isinstance(state.get("mcp"), dict):
             raise ConfigError("Unsupported personal manifest")
         validate_links(state["links"], personal=True)
+        if state.get("lifecycle_version", 1) != 1:
+            raise ConfigError("Unsupported global lifecycle manifest")
+        if "detached" in state and not isinstance(state["detached"], bool):
+            raise ConfigError("Invalid detached global state")
+        for field in ("skills", "removed_skills", "shared_files"):
+            if not isinstance(state.get(field, {}), dict):
+                raise ConfigError(f"Invalid personal {field} state")
+        for name, record in state.get("skills", {}).items():
+            if not SKILL_NAME.fullmatch(name) or not isinstance(record, dict):
+                raise ConfigError("Invalid owned skill record")
+            if not re.fullmatch(r"[0-9a-f]{64}", record.get("digest", "")):
+                raise ConfigError("Invalid owned skill digest")
+            entries = record.get("entrypoints", {})
+            if not isinstance(entries, dict):
+                raise ConfigError("Invalid owned skill entrypoints")
+            validate_links(entries, personal=True)
+            if any(Path(key).name != name or str(Path(key).parent) not in {".agents/skills", ".claude/skills", ".codex/skills"}
+                   or value not in self.skill_link_values(name, self.home / key)
+                   for key, value in entries.items()):
+                raise ConfigError("Owned skill entrypoint does not point to its shared source")
+            cli = record.get("cli")
+            if cli is not None and (not isinstance(cli, dict) or not isinstance(cli.get("path"), str)
+                                    or not isinstance(cli.get("entry"), dict) or not isinstance(cli.get("key", name), str)):
+                raise ConfigError("Invalid observed Skills CLI metadata")
+            if cli is not None:
+                normalized = re.sub(r"[^a-z0-9._]+", "-", cli.get("key", name).lower()).strip(".-")[:255] or "unnamed-skill"
+                if normalized != name:
+                    raise ConfigError("Observed Skills CLI key does not match its owned skill")
+        if any(not SKILL_NAME.fullmatch(name) or not isinstance(record, dict)
+               for name, record in state.get("removed_skills", {}).items()):
+            raise ConfigError("Invalid intentional skill removal")
+        if set(state.get("shared_files", {})) - {"AGENTS.md", "mcp.json"} or any(
+                not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value)
+                for value in state.get("shared_files", {}).values()):
+            raise ConfigError("Invalid owned shared file")
+        # Interpret pre-0.3 manifests in memory; audits never persist the upgrade.
+        for key, value in state["links"].items():
+            path = Path(key)
+            source = self.personal / "skills" / path.name
+            if str(path.parent) not in {".agents/skills", ".claude/skills", ".codex/skills"}:
+                continue
+            if value not in self.skill_link_values(path.name, self.home / key):
+                raise ConfigError("Managed skill link points outside its shared source")
+            if path.name not in state.get("skills", {}):
+                # Missing legacy sources still have owned entrypoints. An unknown
+                # digest can authorize unlinking those entries, never deletion of
+                # a replacement source or provider copy.
+                baseline = tree_digest(source) if source.is_dir() and not source.is_symlink() else "0" * 64
+                record = state.setdefault("skills", {}).setdefault(path.name, {
+                    "digest": state.get("tool_digest", baseline) if path.name == NAME else baseline,
+                    "entrypoints": {}})
+            else:
+                record = state["skills"][path.name]
+            if record is not None:
+                record["entrypoints"].setdefault(key, value)
+        return state
+
+    def cli_lock_path(self):
+        # Match Skills CLI's XDG override, but never let a fixture --home inherit
+        # an unrelated user's XDG path. A recorded different path is a conflict.
+        xdg = os.environ.get("XDG_STATE_HOME")
+        path = Path(xdg).expanduser() / "skills/.skill-lock.json" if xdg and self.home == Path.home().resolve() else self.home / ".agents/.skill-lock.json"
+        if not path.is_absolute():
+            raise ConfigError("Skills CLI XDG_STATE_HOME must be absolute")
+        self.safe_parent(path)
+        return path
+
+    def cli_lock(self):
+        path = self.cli_lock_path()
+        doc = read_json(path, None)
+        if doc is not None and (doc.get("version") != 3 or not isinstance(doc.get("skills"), dict)
+                                or any(not isinstance(value, dict) for value in doc["skills"].values())):
+            raise ConfigError(f"Unsupported or malformed Skills CLI lockfile: {path}")
+        return path, doc
+
+    def cli_entry(self, doc, name):
+        matches = []
+        for key, entry in (doc or {}).get("skills", {}).items():
+            normalized = re.sub(r"[^a-z0-9._]+", "-", key.lower()).strip(".-")[:255] or "unnamed-skill"
+            if normalized == name:
+                matches.append((key, entry))
+        if len(matches) > 1:
+            raise ConfigError(f"Ambiguous Skills CLI installation records: {name}")
+        return matches[0] if matches else (name, None)
+
+    def global_pending(self, state=None):
+        state = state if state is not None else self.personal_state()
+        path, doc = self.cli_lock()
+        pending = {}
+        if state.get("detached"):
+            return pending
+        for name, record in state.get("skills", {}).items():
+            if name in state.get("removed_skills", {}):
+                continue
+            missing = [key for key in record["entrypoints"] if not exists(self.home / key)]
+            source = self.personal / "skills" / name
+            if not source.is_dir() or source.is_symlink():
+                missing.append("shared source")
+            cli = record.get("cli")
+            if cli and cli["path"] != str(path):
+                self.issue(f"Skills CLI lockfile location changed for {name}; reconcile before cleanup")
+            elif cli and (doc is None or cli.get("key", name) not in doc["skills"]):
+                missing.append("Skills CLI installation record")
+            if missing:
+                pending[name] = {"kind": "removal", "missing": missing}
+        for name in state.get("removed_skills", {}):
+            if any(exists(self.home / directory / name) for directory in (".agents/skills", ".claude/skills", ".codex/skills")):
+                pending[name] = {"kind": "reinstall", "missing": []}
+        return pending
+
+    def record_skills(self, state, targets, blocked):
+        path, doc = self.cli_lock()
+        state["lifecycle_version"] = 1
+        owned = state.setdefault("skills", {})
+        for source in sorted((self.personal / "skills").iterdir()):
+            if source.name in blocked or not SKILL_NAME.fullmatch(source.name) or not (source / "SKILL.md").is_file() or source.is_symlink():
+                continue
+            entries = {str((target / source.name).relative_to(self.home)): state["links"][str((target / source.name).relative_to(self.home))]
+                       for target in targets if str((target / source.name).relative_to(self.home)) in state["links"]}
+            if not entries:
+                continue
+            previous = owned.get(source.name, {})
+            if previous.get("cli", {}).get("path", str(path)) != str(path):
+                continue
+            # Accept edited canonical content only after an explicit successful
+            # reconciliation, not during audits or when provider copies conflict.
+            healthy = len(entries) == len(targets) and all(
+                (self.home / key).is_symlink() and os.readlink(self.home / key) == value
+                for key, value in entries.items())
+            record = {**previous, "digest": tree_digest(source) if healthy or not previous else previous["digest"],
+                      "entrypoints": entries}
+            cli_key, entry = self.cli_entry(doc, source.name)
+            if entry is not None and healthy:
+                record["cli"] = {"path": str(path), "key": cli_key, "entry": copy.deepcopy(entry)}
+            owned[source.name] = record
+        state.setdefault("removed_skills", {})
+
+    def private_vcs(self, path: Path):
+        return path.is_dir() and any(item.name in {".git", ".hg", ".svn"} for item in path.rglob("*"))
+
+    def delete_owned(self, path: Path):
+        self.safe_parent(path)
+        if not exists(path):
+            return
+        self.changed(f"Remove owned resource: {path}")
+        if self.apply:
+            self.backup(path)
+            if path.is_dir() and not path.is_symlink():
+                shutil.rmtree(path)
+            else:
+                path.unlink()
+
+    def skill_cleanup(self, name, state, lock_path, lock_doc):
+        record = state.get("skills", {}).get(name)
+        source = self.personal / "skills" / name
+        if (self.personal / "bin/agent-sync-config").is_file() and (self.personal / "skills/agent-sync-config/scripts/agent_sync_config.py").is_file():
+            self.issue(f"Publisher source tree cannot be removed by lifecycle commands: {self.personal}")
+            return []
+        if record is None:
+            if name in state.get("removed_skills", {}) and not exists(source):
+                return []
+            self.issue(f"Skill is not recorded as owned: {name}; synchronize or explicitly adopt it first")
+            return []
+        paths = []
+        self.safe_parent(source)
+        if exists(source):
+            if self.private_vcs(source):
+                self.issue(f"Private version-control data inside shared skill (preserved): {source}")
+            elif source.is_symlink() or not source.is_dir() or tree_digest(source) != record["digest"]:
+                self.issue(f"Changed shared skill source (preserved): {source}")
+            else:
+                paths.append(source)
+        for key, expected in record["entrypoints"].items():
+            target = self.home / key
+            self.safe_parent(target)
+            if not exists(target):
+                continue
+            if target.is_symlink() and os.readlink(target) == expected:
+                paths.insert(0, target)
+            elif target.is_dir() and not target.is_symlink() and tree_digest(target) == record["digest"]:
+                paths.insert(0, target)
+            else:
+                self.issue(f"Changed skill entrypoint (preserved): {target}")
+        cli = record.get("cli")
+        if cli and cli["path"] != str(lock_path):
+            self.issue(f"Skills CLI lockfile location changed (preserved): {name}")
+        cli_key, entry = self.cli_entry(lock_doc, name)
+        if entry is not None:
+            if not cli or cli["path"] != str(lock_path) or cli.get("key", name) != cli_key or cli["entry"] != entry:
+                self.issue(f"Changed or unowned Skills CLI installation record (preserved): {name}")
+        return paths
+
+    def remove_skill(self, name):
+        if not SKILL_NAME.fullmatch(name):
+            raise ConfigError("Skill name must use lowercase letters, numbers, and hyphens")
+        if name == NAME:
+            raise ConfigError("Use uninstall --scope global to remove agent-sync-config and its hooks")
+        state = self.personal_state()
+        lock_path, lock_doc = self.cli_lock()
+        if state.get("detached"):
+            self.issue("Global synchronization is detached; no skill cleanup is authorized")
+            return self
+        paths = self.skill_cleanup(name, state, lock_path, lock_doc)
+        for path in paths:
+            self.safe_parent(path)
+        if self.issues:
+            return self
+        for path in paths:
+            self.delete_owned(path)
+        record = state.setdefault("skills", {}).pop(name, None)
+        if record is not None:
+            state.setdefault("removed_skills", {})[name] = {"digest": record["digest"]}
+            for key in record["entrypoints"]:
+                state["links"].pop(key, None)
+            cli_key = record.get("cli", {}).get("key", name)
+            if lock_doc is not None and cli_key in lock_doc["skills"]:
+                del lock_doc["skills"][cli_key]
+                self.write(lock_path, json_text(lock_doc), 0o600)
+            state["lifecycle_version"] = 1
+            self.write(self.personal / ".agent-sync.json", json_text(state), 0o600)
+        return self
+
+    def restore_skill(self, name):
+        state = self.personal_state()
+        source = self.personal / "skills" / name
+        record = state.get("skills", {}).get(name)
+        self.cli_lock()  # Validate external metadata before importing or writing.
+        if name in state.get("removed_skills", {}):
+            candidates = [self.home / directory / name for directory in (".agents/skills", ".claude/skills", ".codex/skills")]
+            candidates = [path for path in candidates if path.is_dir() and not path.is_symlink() and (path / "SKILL.md").is_file()]
+            if not candidates:
+                self.issue(f"Reinstallation requires an ordinary Skills CLI source or explicit --import-skill: {name}")
+                return self
+            if len({tree_digest(path) for path in candidates}) != 1:
+                self.issue(f"Reinstalled provider skill copies differ (preserved): {name}")
+                return self
+            self.import_skill(candidates[0])
+            if self.issues:
+                return self
+            state["removed_skills"].pop(name)
+            state["skills"].pop(name, None)
+        elif record is not None:
+            if not source.is_dir() or source.is_symlink():
+                if name != NAME:
+                    self.issue(f"Shared source is missing; explicitly import a replacement: {name}")
+                    return self
+            elif tree_digest(source) != record["digest"]:
+                self.issue(f"Changed shared skill source (preserved): {source}")
+                return self
+            path, doc = self.cli_lock()
+            cli = record.get("cli")
+            if cli:
+                if cli["path"] != str(path):
+                    self.issue(f"Skills CLI lockfile location changed for {name}")
+                    return self
+                cli_key = cli.get("key", name)
+                if doc is not None and cli_key in doc["skills"] and doc["skills"][cli_key] != cli["entry"]:
+                    self.issue(f"Changed Skills CLI installation record (preserved): {name}")
+                    return self
+                doc = doc or {"version": 3, "skills": {}}
+                if cli_key not in doc["skills"]:
+                    doc["skills"][cli_key] = cli["entry"]
+                    self.write(path, json_text(doc), 0o600)
+        if self.apply:
+            self.write(self.personal / ".agent-sync.json", json_text(state), 0o600)
+        self.restoring.add(name)
+        return self
+
+    def uninstall(self, purge=False):
+        state = self.personal_state()
+        lock_path, lock_doc = self.cli_lock()
+        owned = state.get("skills", {})
+        runtime = self.personal / "skills" / NAME
+        recovery = self.registry.get("global_uninstall")
+        if not owned and not state.get("links") and not recovery:
+            self.notes.append("No owned global installation to uninstall.")
+            return self
+        if recovery and recovery.get("purge") != purge:
+            raise ConfigError("Resume the interrupted uninstall with its original --purge-shared-sources choice")
+        materialize = []
+        relink = []
+        delete = []
+        # Compute the entire plan first. A conflicting artifact blocks all edits.
+        for key in (".codex/AGENTS.md", ".claude/CLAUDE.md"):
+            if key not in state["links"]:
+                continue
+            target, source = self.home / key, self.personal / "AGENTS.md"
+            self.safe_parent(source)
+            expected = os.path.relpath(source, target.parent)
+            if recovery and not exists(source) and target.is_file() and not target.is_symlink() and digest(target.read_bytes()) == recovery.get("state", {}).get("shared_files", {}).get("AGENTS.md"):
+                continue
+            if state["links"][key] != expected or not source.is_file() or source.is_symlink():
+                self.issue(f"Cannot detach personal instructions: {source}")
+            elif target.is_symlink() and os.readlink(target) == expected:
+                materialize.append((source, target))
+            elif not target.is_file() or target.is_symlink() or target.read_bytes() != source.read_bytes():
+                self.issue(f"Changed instruction entrypoint (preserved): {target}")
+        for name, record in owned.items():
+            if name == NAME or name in state.get("removed_skills", {}):
+                continue
+            source = self.personal / "skills" / name
+            self.safe_parent(source)
+            native = self.home / ".agents/skills" / name
+            if recovery and not exists(source) and native.is_dir() and not native.is_symlink() and tree_digest(native) == record["digest"]:
+                source = native
+            if not source.is_dir() or source.is_symlink() or tree_digest(source) != record["digest"]:
+                self.issue(f"Changed or missing shared skill (preserved): {source}")
+                continue
+            try:
+                portable_skill(source)
+            except ConfigError as exc:
+                self.issue(f"Cannot preserve portable native skill {source}: {exc}")
+                continue
+            for key, expected in record["entrypoints"].items():
+                target = self.home / key
+                if exists(target) and not (target.is_symlink() and os.readlink(target) in {
+                        expected, os.path.relpath(native, target.parent)}):
+                    if not target.is_dir() or target.is_symlink() or tree_digest(target) != record["digest"]:
+                        self.issue(f"Changed skill entrypoint (preserved): {target}")
+            if exists(native) and not (native.is_symlink() and os.readlink(native) == os.path.relpath(source, native.parent)):
+                if not native.is_dir() or native.is_symlink() or tree_digest(native) != record["digest"]:
+                    self.issue(f"Changed canonical native skill (preserved): {native}")
+            materialize.append((source, native))
+            for key in record["entrypoints"]:
+                if key != str(native.relative_to(self.home)):
+                    relink.append((self.home / key, native))
+            if purge:
+                if self.private_vcs(source):
+                    self.issue(f"Private version-control data inside shared skill (preserved): {source}")
+                delete.append(self.personal / "skills" / name)
+        # Runtime removal must validate both the source and entrypoints, even when
+        # npx skills has already removed some of them.
+        if NAME in owned:
+            delete.extend(self.skill_cleanup(NAME, state, lock_path, lock_doc))
+        elif exists(runtime) and not state.get("detached"):
+            self.issue(f"Setup runtime is not recorded as owned (preserved): {runtime}")
+        wrapper = self.home / ".local/bin/agent-sync-config"
+        expected_wrapper = state.get("wrapper_digest") or digest(self.wrapper(runtime).encode())
+        if exists(wrapper):
+            if wrapper.is_symlink() or not wrapper.is_file() or digest(wrapper.read_bytes()) != expected_wrapper:
+                self.issue(f"Changed terminal wrapper (preserved): {wrapper}")
+            else:
+                delete.append(wrapper)
+        hook_docs = []
+        commands = self.registry.get("hook_commands", {})
+        if not isinstance(commands, dict):
+            raise ConfigError("Invalid recorded global hook commands")
+        for provider, relative in (("codex", ".codex/hooks.json"), ("claude", ".claude/settings.json")):
+            path = self.home / relative
+            doc = read_json(path, {})
+            if path.is_symlink():
+                self.issue(f"Linked hook settings (preserved): {path}")
+            hooks = doc.get("hooks", {})
+            if not isinstance(hooks, dict):
+                raise ConfigError(f"Expected hooks object: {path}")
+            previous = commands.get(provider, [])
+            if not isinstance(previous, list) or any(not isinstance(command, str) for command in previous):
+                raise ConfigError("Invalid recorded hook command")
+            changed = False
+            for event, groups in hooks.items():
+                if not isinstance(groups, list):
+                    raise ConfigError(f"Expected hook groups: {path}")
+                remaining_groups = []
+                for group in groups:
+                    if not isinstance(group, dict) or not isinstance(group.get("hooks"), list):
+                        raise ConfigError(f"Invalid hook group: {path}")
+                    remaining = []
+                    group_changed = False
+                    for handler in group["hooks"]:
+                        if not isinstance(handler, dict):
+                            raise ConfigError(f"Invalid hook handler: {path}")
+                        command = handler.get("command", "")
+                        if command in previous and handler.get("type") == "command":
+                            changed = True
+                            group_changed = True
+                        else:
+                            if isinstance(command, str) and str(runtime / "scripts/agent_sync_config.py") in command:
+                                self.issue(f"Modified global runtime hook (preserved): {path} [{event}]")
+                            remaining.append(handler)
+                    if remaining or not group_changed:
+                        remaining_groups.append({**group, "hooks": remaining})
+                hooks[event] = remaining_groups
+            if changed:
+                hook_docs.append((path, doc))
+        if purge:
+            shared = state.get("shared_files", {})
+            if not shared and state["links"]:
+                shared = {"AGENTS.md": True, **({"mcp.json": True} if any(state.get("mcp", {}).values()) else {})}
+            if "mcp.json" in shared and (self.personal / "mcp.json").is_file():
+                neutral = read_json(self.personal / "mcp.json")
+                if neutral.get("schema") != SCHEMA or not isinstance(neutral.get("servers"), dict):
+                    raise ConfigError("Invalid shared MCP manifest")
+                for provider, (path, doc, key) in self.mcp_documents(True).items():
+                    for name, server in neutral["servers"].items():
+                        actual = plain(doc.get(key, {}).get(name))
+                        if provider == "claude" and isinstance(actual, dict) and "command" in actual:
+                            actual = {"type": "stdio", **actual}
+                        if actual != render_server(server, provider):
+                            self.issue(f"Shared MCP is not preserved in native configuration: {path} [{name}]")
+            for name in shared:
+                source = self.personal / name
+                if exists(source) and (source.is_symlink() or not source.is_file()):
+                    self.issue(f"Changed shared source type (preserved): {source}")
+                else:
+                    delete.append(source)
+        for path in [target for _, target in materialize] + [target for target, _ in relink] + delete + [path for path, _ in hook_docs]:
+            self.safe_parent(path)
+        if self.issues:
+            return self
+        # A small recovery record retains ownership until the last bundle and
+        # source are gone; project registrations are never consumed by cleanup.
+        if self.apply and not recovery:
+            # Instructions may have changed through their shared symlink since
+            # the last sync. Recovery must recognize the copies just preserved.
+            for source, target in materialize:
+                if source == self.personal / "AGENTS.md":
+                    state.setdefault("shared_files", {})["AGENTS.md"] = digest(source.read_bytes())
+            self.registry["global_uninstall"] = {"personal_root": str(self.personal), "state": copy.deepcopy(state), "purge": purge}
+            self.write(self.registry_path, json_text(self.registry), 0o600)
+        for source, target in materialize:
+            if target.is_symlink() or not exists(target):
+                self.changed(f"Preserve native copy: {source} -> {target}")
+                if self.apply:
+                    self.backup(target)
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    if target.is_symlink():
+                        target.unlink()
+                    if source.is_dir():
+                        temporary = Path(tempfile.mkdtemp(prefix=".agent-sync-copy-", dir=target.parent))
+                        try:
+                            shutil.copytree(source, temporary, dirs_exist_ok=True)
+                            if tree_digest(temporary) != tree_digest(source):
+                                raise ConfigError(f"Native skill copy could not be verified: {target}")
+                            os.replace(temporary, target)
+                        finally:
+                            if temporary.exists():
+                                shutil.rmtree(temporary)
+                    else:
+                        self.write(target, source.read_text(), source.stat().st_mode & 0o777)
+            if self.apply and ((source.is_dir() and tree_digest(target) != tree_digest(source)) or
+                               (source.is_file() and target.read_bytes() != source.read_bytes())):
+                raise ConfigError(f"Native copy verification failed: {target}")
+        for target, native in relink:
+            desired = os.path.relpath(native, target.parent)
+            if target.is_symlink() and os.readlink(target) == desired:
+                continue
+            # Matching ordinary copies are already usable and need no conversion.
+            if target.is_dir() and not target.is_symlink():
+                continue
+            self.changed(f"Detach provider skill link: {target} -> {desired}")
+            if self.apply:
+                self.backup(target)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if exists(target):
+                    target.unlink()
+                target.symlink_to(desired)
+        for path, doc in hook_docs:
+            self.write(path, json_text(doc))
+        tool_key = owned.get(NAME, {}).get("cli", {}).get("key", NAME)
+        if lock_doc is not None and tool_key in lock_doc["skills"] and NAME in owned:
+            del lock_doc["skills"][tool_key]
+            self.write(lock_path, json_text(lock_doc), 0o600)
+        # Keep recovery state until all sources are removed. On retry, native
+        # copies are accepted above; the last executing bundle is deleted last.
+        for path in dict.fromkeys(delete):
+            if path != runtime:
+                self.delete_owned(path)
+        state["detached"] = True
+        state["lifecycle_version"] = 1
+        self.write(self.personal / ".agent-sync.json", json_text(state), 0o600)
+        if purge:
+            self.delete_owned(self.personal / ".agent-sync.json")
+        cache_key = digest(("global:" + str(self.personal)).encode())[:24]
+        self.delete_owned(self.state_dir / "cache" / (cache_key + ".json"))
+        self.delete_owned(runtime)
+        for key in ("personal_root", "hook_commands", "global_hooks_audit_only", "global_uninstall"):
+            self.registry.pop(key, None)
+        self.write(self.registry_path, json_text(self.registry), 0o600)
+        if self.apply:
+            for directory in (self.personal / "skills", self.personal):
+                if directory.is_dir() and not directory.is_symlink() and not any(directory.iterdir()):
+                    directory.rmdir()
+        return self
+
+    def wrapper(self, runtime):
+        return "#!/bin/sh\nexec " + shlex.join([sys.executable, str(runtime / "scripts/agent_sync_config.py")]) + ' "$@"\n'
+
+    def personal_setup(self, imported_skill=None, imported_mcp=None):
+        personal_manifest_path = self.personal / ".agent-sync.json"
+        state = self.personal_state()
+        self.pending_removals = self.global_pending(state)
+        if imported_skill:
+            portable_skill(imported_skill.expanduser().resolve())
+            name = imported_skill.expanduser().resolve().name
+            self.import_skill(imported_skill)
+            if not self.issues:
+                record = state.get("skills", {}).get(name, {})
+                observed = record.get("cli")
+                path, doc = self.cli_lock()
+                if name in self.pending_removals and observed and observed["path"] == str(path) and (doc is None or observed.get("key", name) not in doc["skills"]):
+                    doc = doc or {"version": 3, "skills": {}}
+                    doc["skills"][observed.get("key", name)] = observed["entry"]
+                    self.write(path, json_text(doc), 0o600)
+                state.setdefault("removed_skills", {}).pop(name, None)
+                state.setdefault("skills", {}).pop(name, None)
+                self.pending_removals.pop(name, None)
+                self.restoring.add(name)
+        blocked = set(state.get("removed_skills", {})) | (set(self.pending_removals) - self.restoring)
+        self.pending_removals = {name: item for name, item in self.pending_removals.items() if name not in self.restoring}
+        for name in sorted(self.pending_removals):
+            kind = self.pending_removals[name]["kind"]
+            self.issue(f"Pending skill {kind}: {name}; choose removal/uninstall or restoration during interactive global sync")
+        if self.registry.get("global_uninstall"):
+            self.issue("Global uninstall is interrupted; resume uninstall with its original purge choice before synchronizing")
+            return
+        if state.get("detached") and not self.apply:
+            self.notes.append("Global synchronization is detached; explicit global sync can reattach retained sources.")
+            return
         self.mkdir(self.personal)
         agents = self.personal / "AGENTS.md"
         candidates = [path for path in (self.home / ".codex/AGENTS.md", self.home / ".claude/CLAUDE.md")
@@ -811,22 +1349,32 @@ class Sync:
             self.issue("Global AGENTS.override.md masks shared personal instructions in Codex")
         canonical = self.personal / "skills"
         self.mkdir(canonical)
-        target = self.install_runtime(canonical, state)
+        target = canonical / NAME
+        if NAME not in blocked:
+            target = self.install_runtime(canonical, state)
         targets = [self.home / ".agents/skills", self.home / ".claude/skills"]
         # Adopt legacy Codex skills without touching its .system directory.
         legacy = self.home / ".codex/skills"
         if legacy.is_dir():
             targets.append(legacy)
-        if imported_skill:
-            self.import_skill(imported_skill)
-        self.skills(canonical, targets, state["links"], self.home)
+        self.skills(canonical, targets, state["links"], self.home, blocked)
+        if not self.hook:
+            self.record_skills(state, targets, blocked)
         self.mcp(self.personal / "mcp.json", state["mcp"], personal=True, imported=imported_mcp)
         if self.apply:
             self.registry["personal_root"] = str(self.personal)
-        self.install_hooks()
-        wrapper = "#!/bin/sh\nexec " + shlex.join([sys.executable, str(target / "scripts/agent_sync_config.py")]) + ' "$@"\n'
-        self.write(self.home / ".local/bin/agent-sync-config", wrapper, 0o755)
-        self.write(personal_manifest_path, json_text(state))
+        if NAME not in blocked:
+            self.install_hooks()
+            wrapper = self.wrapper(target)
+            self.write(self.home / ".local/bin/agent-sync-config", wrapper, 0o755)
+            state["wrapper_digest"] = digest(wrapper.encode())
+        state.pop("detached", None)
+        shared = state.setdefault("shared_files", {})
+        for name in ("AGENTS.md", "mcp.json"):
+            if (self.personal / name).is_file():
+                shared[name] = digest((self.personal / name).read_bytes())
+        if self.apply:
+            self.write(personal_manifest_path, json_text(state), 0o600)
 
     def run(self, imported_skill: Path | None = None, imported_mcp: Path | None = None):
         if self.scope == "global":
@@ -896,7 +1444,7 @@ def fingerprint(sync: Sync):
                  ".claude/settings.json", ".claude/settings.local.json")]
         skill_dirs = [sync.root / name for name in (".agents/skills", ".claude/skills", ".codex/skills")]
     else:
-        paths = [sync.registry_path, sync.personal / ".agent-sync.json", sync.personal / "AGENTS.md", sync.personal / "mcp.json"]
+        paths = [sync.registry_path, sync.personal / ".agent-sync.json", sync.personal / "AGENTS.md", sync.personal / "mcp.json", sync.cli_lock_path()]
         paths += [sync.home / name for name in (".codex/AGENTS.md", ".codex/AGENTS.override.md", ".claude/CLAUDE.md",
                   ".codex/config.toml", ".claude.json", ".codex/hooks.json", ".claude/settings.json", ".local/bin/agent-sync-config")]
         skill_dirs = [sync.personal / "skills", sync.home / ".agents/skills", sync.home / ".claude/skills", sync.home / ".codex/skills"]
@@ -993,9 +1541,72 @@ def hook(args):
         return 0
 
 
+def confirm_changes(result, args):
+    if not result.changes or args.yes:
+        return True
+    if args.json or not sys.stdin.isatty() or not sys.stdout.isatty():
+        raise ConfigError("Confirmation required: review --dry-run, then use --yes for noninteractive cleanup")
+    for change in result.changes:
+        print(change)
+    try:
+        return input("Apply this cleanup? [y/N]: ").strip().lower() in {"y", "yes"}
+    except (EOFError, KeyboardInterrupt):
+        return False
+
+
+def lifecycle_operation(operation, args):
+    return operation.remove_skill(args.skill_name) if args.action == "remove-skill" else operation.uninstall(args.purge_shared_sources)
+
+
+def lifecycle_execute(home, args):
+    preview = lifecycle_operation(Sync(home, None, False, args.personal_root, scope="global"), args)
+    if preview.issues or args.dry_run or args.read_only:
+        return preview
+    if not confirm_changes(preview, args):
+        preview.changes.clear()
+        preview.notes.append("Cancelled; no changes made.")
+        return preview
+    if not preview.changes:
+        return preview
+    with lock(home):
+        return lifecycle_operation(Sync(home, None, True, args.personal_root, scope="global"), args)
+
+
+def interactive_removals(home, args):
+    probe = Sync(home, None, False, args.personal_root, scope="global")
+    pending = probe.global_pending()
+    if not pending or args.json or not sys.stdin.isatty() or not sys.stdout.isatty():
+        return [], False
+    choices = []
+    for name, item in sorted(pending.items(), key=lambda item: (item[0] != NAME, item[0])):
+        if args.import_skill and name == args.import_skill.expanduser().resolve().name:
+            continue
+        remove_label = "Uninstall synchronizer (keep native configuration)" if name == NAME else "Complete removal of the shared source"
+        restore_label = "Accept reinstallation" if item["kind"] == "reinstall" else "Restore installation"
+        print(f"Pending {item['kind']}: {name}\n1. {remove_label}\n2. {restore_label}\nq. Cancel")
+        try:
+            choice = input("Choose [1/2/q]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            choice = "q"
+        if choice in {"", "q", "cancel"}:
+            return [], True
+        if choice not in {"1", "2"}:
+            raise ConfigError("Choose removal, restoration, or cancellation; no changes made")
+        choices.append((name, choice == "1"))
+        if name == NAME and choice == "1":
+            # Full uninstall keeps all remaining native configuration; there is
+            # no reason to ask about separate skill decisions afterward.
+            return choices, False
+    return choices, False
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", nargs="?", choices=("sync", "check", "hook"), default="sync")
+    parser.add_argument("action", nargs="?", choices=("sync", "check", "hook", "remove-skill", "uninstall"), default="sync")
+    parser.add_argument("skill_name", nargs="?", help="Owned skill to remove")
+    parser.add_argument("--dry-run", action="store_true", help="Preview without writes or locks")
+    parser.add_argument("--yes", action="store_true", help="Confirm an explicit cleanup; does not resolve ambiguous removals")
+    parser.add_argument("--purge-shared-sources", action="store_true", help="Uninstall and delete redundant owned personal sources")
     parser.add_argument("--version", action="version", version=VERSION)
     parser.add_argument("--scope", choices=("project", "global"), action="append", help="Select project or global resources exclusively")
     parser.add_argument("--project", type=Path, help="Project directory (default: current directory); project scope only")
@@ -1009,7 +1620,7 @@ def main(argv=None):
     parser.add_argument("--import-mcp", type=Path, help="Adopt Claude-format mcpServers into the selected scope")
     args = parser.parse_args(argv)
     scope, root, selection_required = args.scope[-1] if args.scope else None, None, False
-    apply = args.action != "check" and not args.read_only
+    apply = args.action != "check" and not args.read_only and not args.dry_run
     try:
         if args.scope and len(set(args.scope)) > 1:
             raise ConfigError("Contradictory --scope values; choose project or global")
@@ -1021,6 +1632,20 @@ def main(argv=None):
             raise ConfigError("--project cannot be used with --scope global")
         if args.personal_root and scope != "global":
             raise ConfigError("--personal-root requires --scope global")
+        destructive = args.action in {"remove-skill", "uninstall"}
+        if destructive:
+            if scope != "global" or args.project_only:
+                raise ConfigError("Global lifecycle commands require explicit --scope global")
+            if args.import_skill or args.import_mcp:
+                raise ConfigError("Lifecycle commands do not accept imports")
+            if args.action == "remove-skill" and not args.skill_name:
+                raise ConfigError("remove-skill requires a skill name")
+        if args.skill_name and args.action != "remove-skill":
+            raise ConfigError("A skill name is only accepted by remove-skill")
+        if args.purge_shared_sources and args.action != "uninstall":
+            raise ConfigError("--purge-shared-sources requires uninstall --scope global")
+        if args.action == "hook" and (args.dry_run or args.yes):
+            raise ConfigError("Hook handlers do not accept lifecycle flags")
         if args.action == "hook":
             args.scope = scope
             return hook(args)
@@ -1050,14 +1675,46 @@ def main(argv=None):
         if scope == "global":
             root = None
         # Validate target/manifest before creating runtime state or acquiring a lock.
-        operation = Sync(home, root, apply, args.personal_root, scope=scope)
-        if apply:
-            with lock(home):
-                result = operation.run(args.import_skill, args.import_mcp)
+        if destructive:
+            result = lifecycle_execute(home, args)
         else:
-            result = operation.run(args.import_skill, args.import_mcp)
+            choices, cancelled = interactive_removals(home, args) if scope == "global" and apply else ([], False)
+            operation = Sync(home, root, apply, args.personal_root, scope=scope)
+            if cancelled:
+                result = operation
+                result.notes.append("Cancelled; no changes made.")
+            elif apply:
+                previews = []
+                for name, remove in choices:
+                    preview = Sync(home, None, False, args.personal_root, scope="global")
+                    preview.uninstall() if remove and name == NAME else preview.remove_skill(name) if remove else preview.restore_skill(name)
+                    previews.append((preview, remove))
+                blocked = next((preview for preview, _ in previews if preview.issues), None)
+                confirmed = blocked is None and all(not remove or confirm_changes(preview, args) for preview, remove in previews)
+                if blocked is not None:
+                    result = blocked
+                elif not confirmed:
+                    result = operation
+                    result.notes.append("Cancelled; no changes made.")
+                else:
+                    with lock(home):
+                        result = operation
+                        uninstalled = False
+                        for name, remove in choices:
+                            if remove and name == NAME:
+                                result = operation.uninstall()
+                                uninstalled = True
+                                break
+                            operation.remove_skill(name) if remove else operation.restore_skill(name)
+                            if operation.issues:
+                                break
+                        if not uninstalled and not operation.issues:
+                            result = operation.run(args.import_skill, args.import_mcp)
+            else:
+                result = operation.run(args.import_skill, args.import_mcp)
         report = {"version": VERSION, "scope": scope, "project": str(root) if root else None,
-                  "read_only": not apply, "changes": result.changes, "issues": result.issues, "notes": result.notes}
+                  "read_only": not apply, "changes": result.changes, "issues": result.issues, "notes": result.notes,
+                  "pending_removals": result.pending_removals}
         if args.json:
             print(json_text(report), end="")
         else:
@@ -1067,7 +1724,7 @@ def main(argv=None):
                     print(f"{kind}: {message}")
             if not result.issues and not result.changes:
                 print("Configuration is synchronized.")
-        return 1 if result.issues or (not apply and result.changes) else 0
+        return 1 if result.issues or (not apply and result.changes and not args.dry_run) else 0
     except (ConfigError, OSError, ValueError, TypeError, KeyError) as exc:
         # Never print configuration contents or resolved environment values on error.
         message = str(exc) if isinstance(exc, ConfigError) else type(exc).__name__
