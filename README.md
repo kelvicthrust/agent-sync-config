@@ -6,7 +6,7 @@ Share local agent instructions, skills, curated context, and MCP definitions
 across Codex and Claude Code. One repeatable command initializes a new repository
 or reconciles an existing one, while preserving conflicting content.
 
-**v0.3.0 preview (not yet released).** Initial support targets macOS/Linux with Python 3.11+ and
+**[v0.3.0 preview](https://github.com/kelvicthrust/agent-sync-config/tree/v0.3.0).** Initial support targets macOS/Linux with Python 3.11+ and
 local Codex/Claude Code clients. Ensure `python3` resolves to Python 3.11+ in
 the terminal and native hook environment. See [testing and compatibility](docs/testing.md)
 for verified capabilities and limits.
@@ -21,16 +21,16 @@ npx skills add kelvicthrust/agent-sync-config \
   --skill agent-sync-config --global --agent codex claude-code
 ```
 
-To install the previously released v0.2.0 preview (without the lifecycle commands below):
+To install the fixed v0.3.0 preview:
 
 ```sh
-npx skills add https://github.com/kelvicthrust/agent-sync-config/tree/v0.2.0 \
+npx skills add https://github.com/kelvicthrust/agent-sync-config/tree/v0.3.0 \
   --skill agent-sync-config --global --agent codex claude-code
 ```
 
-See [v0.2.0 release notes](https://github.com/kelvicthrust/agent-sync-config/releases/tag/v0.2.0)
-for changes and migration steps. The unversioned command above follows the
-repository's default branch; creating a release does not change that source.
+See [upgrading to 0.3.0](#upgrade-to-the-030-lifecycle-behavior) for migration steps.
+The unversioned command above follows the repository's default branch;
+creating a version tag does not change that source.
 
 For a local checkout, replace `kelvicthrust/agent-sync-config` with its absolute
 path. `--global` here installs the **skill** for discovery in any project. It does
@@ -358,8 +358,8 @@ Use the updated script/skill for this first upgrade; an existing terminal wrappe
 may still execute 0.2.0. Existing missing entrypoints are reported for a decision
 rather than repaired automatically. Audits interpret older
 manifests without writing an upgrade. Review native hook trust and restart clients
-when updating the runtime. This checkout is the 0.3.0 preview; the published
-v0.2.0 tag does not contain these lifecycle commands.
+when updating the runtime. The v0.3.0 tag includes these lifecycle commands;
+the older v0.2.0 tag does not.
 
 ## Automatic checks and limits
 
