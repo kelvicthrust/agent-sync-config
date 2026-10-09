@@ -21,6 +21,17 @@ npx skills add kelvicthrust/agent-sync-config \
   --skill agent-sync-config --global --agent codex claude-code
 ```
 
+To install the fixed v0.2.0 preview rather than the repository's default branch:
+
+```sh
+npx skills add https://github.com/kelvicthrust/agent-sync-config/tree/v0.2.0 \
+  --skill agent-sync-config --global --agent codex claude-code
+```
+
+See [v0.2.0 release notes](https://github.com/kelvicthrust/agent-sync-config/releases/tag/v0.2.0)
+for changes and migration steps. The unversioned command above follows the
+repository's default branch; creating a release does not change that source.
+
 For a local checkout, replace `kelvicthrust/agent-sync-config` with its absolute
 path. `--global` here installs the **skill** for discovery in any project. It does
 not synchronize your personal settings or initialize projects. You do not need
