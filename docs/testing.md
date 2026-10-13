@@ -20,9 +20,11 @@ The suite validates these observable journeys:
 | Existing project | Every local marker selects project; malformed configuration never escalates scope |
 | Scope isolation | Snapshots prove project operations leave personal files intact and global operations leave projects intact |
 | Native sharing | Claude-only instructions/skills are adopted when compatible; references expose edits immediately |
-| Claude-first setup | One sync migrates simple commands, adapts simple agents, and references rules/workflows/styles with limitations |
+| Claude-first setup | One sync migrates simple commands, creates native reference agents, and references rules/workflows/styles with limitations |
 | Command retirement | Replacement and link are verified first; matching replacements and interrupted migrations are retryable; collisions/redirects preserve originals |
-| Agent differences | Original prompts remain; controls, built-in collisions, changed sources, and edited destinations require review |
+| Agent sharing | Native definitions read original bodies; body edits need no regeneration; metadata/tool/definition differences require reconciliation |
+| Agent approval | Flat tool declarations need named acceptance; skip preserves the source; cancellation writes nothing; noninteractive sync never prompts |
+| Agent migration | Exact three-field copied-body adapters upgrade; edited/extended adapters, collisions, and redirected links remain intact; matching native settings survive |
 | Conditional references | Path-gated rules stay conditional; nested files/spaces/relocation work; missing resources remove only generated references |
 | Unsupported resources | Provider execution controls remain intact; no scripts are executed or permission controls weakened |
 | Conflicts | Differing instructions, skill copies, external dependencies, and MCP definitions are preserved |
@@ -54,12 +56,33 @@ mkdir -p "$sandbox/home" "$sandbox/repo"
 For a Claude-first journey, add `.claude/commands/review.md` with an instruction-only
 body, `.claude/agents/reviewer.md` with name/description frontmatter, a path-gated
 `.claude/rules/api.md`, and a `.claude/workflows/review.js` file. Run ordinary sync:
-expect a shared review skill and Claude link, a native Codex reviewer TOML with
-its unchanged instruction body, retained agent/rule/workflow originals, and
+expect a shared review skill and Claude link, a native Codex reviewer TOML that
+directs reading of the original body, retained agent/rule/workflow originals, and
 conditional reading guidance. Check the JSON `resources` dispositions. Add a
-model override or permission field: the original must remain and adaptation must
-require review. Edit either adapted agent file: both paths must be reported.
+model override or permission field: the original must remain and generation must
+be blocked. Edit the original body: the native file must remain unchanged and
+check must pass. Change metadata or generated native fields: both paths must be
+reported. Additional native settings on a matching reference remain intact.
 Repeat sync must make no changes after conflicts are resolved.
+
+For tool-bearing agents, add `tools: Read, Grep, mcp__example__lookup` to flat
+frontmatter. A JSON sync must return 1 and preserve the source without generating
+that agent; unrelated resources may sync. Review the allowlist warning, then run:
+
+```sh
+./bin/agent-sync-config --scope project --home "$sandbox/home" --project "$sandbox/repo" \
+  --accept-agent-reference reviewer --dry-run --json
+./bin/agent-sync-config --scope project --home "$sandbox/home" --project "$sandbox/repo" \
+  --accept-agent-reference reviewer
+```
+
+The dry run writes nothing. The generated native instructions must record the
+declaration and state that Claude's allowlist is not enforced in Codex. Repeat
+sync/check needs no renewed approval. Changing the declaration or native generated
+fields remains a conflict even with approval. Test interactive approve/skip/cancel,
+multiple names, unknown names (2 before writes), and check/approval rejection.
+Delete a source: checks report the missing path and preserve its native definition.
+Use synthetic tools only; do not connect services or change native trust controls.
 
 Expect only native instructions in fresh empty scopes. Add a self-contained skill
 under `.agents/skills`, then sync and inspect its relative Claude link. Edit through
@@ -93,11 +116,15 @@ A localhost protocol stub with dummy keys exercises native project/personal
 instruction loading, installed skill invocation, MCP, planning/read-only mode,
 resume, and absence of automatic reference repair. It also verifies that migrated
 commands load as skills in both clients,
-Codex advertises project/global adapted agents in its native catalog, and Claude
+Codex advertises project/global reference agents in its native catalog, and Claude
 still discovers original agents. Path-gated rule references reach Codex without
-automatically injecting their bodies. The stub returns no tool call: these sessions
-verify catalogs/loading and protocol behavior, not real model compliance, agent
-execution, or actual skill execution. CLI tests separately exercise the installed runtime.
+automatically injecting their bodies. A scripted stub tool call spawns one native
+reference agent and verifies delivery of its source-reading instructions and
+reviewed tools warning. Its prompt body is not automatically injected. This proves
+native spawn/configuration delivery, not model-driven source reading or permission
+equivalence. Other responses perform no tool calls. CLI tests separately exercise
+the installed runtime; these fixtures do not prove actual skill execution or model
+compliance.
 No hook-trust bypass or authenticated model session is needed. Localhost access
 is required; native clients may create their own disposable session files.
 
@@ -179,3 +206,30 @@ and Claude Code 2.1.295:
 Only disposable fixtures were synchronized. No personal configuration or existing
 user projects were changed, and no authenticated model sessions were used.
 Linux and the other CI interpreter versions have not been run for these local edits.
+
+## Local 0.7.0 verification
+
+Verified on macOS with Python 3.9.6, Skills CLI 1.7.1, Codex CLI 0.162.0,
+and Claude Code 2.1.295:
+
+- All 76 automated tests passed (17.432 seconds). Focused agent/resource tests
+  ran during development; the full suite ran once after implementation settled.
+- Fixtures cover named approvals, interactive approve/skip/cancel, invalid names,
+  dry runs/checks without writes, body sharing, metadata/tool conflicts, legacy
+  upgrade boundaries, native settings, missing/redirected sources, scope isolation,
+  relocation, nested/worktree discovery, and intervening preflight edits.
+- Real local Skills CLI installation exercised the installed runtime's project
+  references and reviewed global tool declarations. Native skill/MCP discovery,
+  no synchronizer hooks/duplicate skill entries, installer removal, and continued
+  native usability passed in disposable homes.
+- Offline Codex/Claude sessions verified project/global reference-agent discovery
+  and retained Claude agents. A scripted native Codex spawn delivered source-reading
+  instructions and the reviewed tools warning. Original prompt bodies were not
+  automatically injected. No real-model source-reading compliance or provider
+  permission equivalence is claimed.
+- Explicit checks with 30 skills and 20 samples measured project median 132.53 ms
+  / p95 135.59 ms and global median 131.93 ms / p95 137.59 ms.
+
+Only disposable fixtures were synchronized. Personal configuration and existing
+user projects were unchanged. No authenticated model sessions were used. Local
+results do not substitute for the macOS/Linux CI interpreter matrix before release.

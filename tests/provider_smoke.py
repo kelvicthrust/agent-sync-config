@@ -109,6 +109,9 @@ def main():
         run(["git", "init", "-q", str(repo)], env, repo)
         commands = repo / ".claude/commands"; commands.mkdir(parents=True)
         (commands / "command-review.md").write_text("Review a fixture command.\n")
+        for scope, name, tools in ((repo, 'project-reviewer', ''), (home, 'personal-reviewer', 'tools: Read, Grep\n')):
+            agents = scope / '.claude/agents'; agents.mkdir(parents=True)
+            (agents / (name + '.md')).write_text(f'---\nname: {name}\ndescription: Review a disposable fixture.\n{tools}---\nRead @context/notes.md.\n')
         folder = repo / ".agents/skills/review-code"; folder.mkdir(parents=True)
         (folder / "SKILL.md").write_text("---\nname: review-code\ndescription: Review a fixture change.\n---\nReview the code.\n")
         (repo / ".mcp.json").write_text(json.dumps({"mcpServers": {
@@ -127,16 +130,22 @@ def main():
                 assert (installed / "scripts/vendor/TOMLKIT-LICENSE").is_file()
                 assert (installed / "scripts/vendor/NOTICE").is_file()
             report["skills_cli_installation"] = "passed"
+        runtime = home / '.agents/skills/agent-sync-config/scripts/agent_sync_config.py' if args.skills_cli else SCRIPT
         (home / ".codex/skills/.system").mkdir(parents=True)
         global_skill = home / ".agents/skills/global-review"
         global_skill.mkdir(parents=True, exist_ok=True)
         (global_skill / "SKILL.md").write_text("---\nname: global-review\ndescription: Review a global fixture.\n---\nReview changes.\n")
         installed_before = snapshot(home / ".agents/skills/agent-sync-config")
-        run([sys.executable, str(SCRIPT), "--scope", "global", "--home", str(home)], env, repo)
+        run([sys.executable, str(runtime), "--scope", "global", "--home", str(home),
+             "--accept-agent-reference", "personal-reviewer"], env, repo)
         assert snapshot(home / ".agents/skills/agent-sync-config") == installed_before
         assert not (home / "agent-config").exists()
         assert not (home / ".local/state/agent-sync-config").exists()
-        run([sys.executable, str(SCRIPT), "--scope", "project", "--home", str(home), "--project", str(repo)], env, repo)
+        run([sys.executable, str(runtime), "--scope", "project", "--home", str(home), "--project", str(repo)], env, repo)
+        for scope, name in ((repo, 'project-reviewer'), (home, 'personal-reviewer')):
+            instructions = (scope / f'.codex/agents/{name}.toml').read_text()
+            assert 'claude-agent-reference' in instructions and '@context/notes.md' not in instructions
+        report['installed_reference_agents'] = 'project reference and reviewed global tools passed'
         # Trust only this disposable test project's config layer for native MCP discovery.
         assert not (repo / ".agents/skills/agent-sync-config").exists()
         assert not (home / ".codex/skills/global-review").exists()

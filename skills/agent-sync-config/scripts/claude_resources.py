@@ -4,12 +4,48 @@ from __future__ import annotations
 import ast
 from collections import Counter
 import json
+from pathlib import Path
 import re
 
 BEGIN = '<!-- agent-sync-config:claude-references:start -->'
 END = '<!-- agent-sync-config:claude-references:end -->'
 NAME = re.compile(r'[a-z0-9]+(?:-[a-z0-9]+)*\Z')
 BUILTINS = {'default', 'worker', 'explorer'}
+AGENT_REFERENCE = 'agent-sync-config:claude-agent-reference'
+
+
+def agent_source(instructions):
+    if not isinstance(instructions, str) or not instructions.startswith(AGENT_REFERENCE + '\nSource: '):
+        return None
+    try:
+        source = json.loads(instructions.splitlines()[1][8:])
+        return source if isinstance(source, str) else None
+    except (ValueError, IndexError):
+        return None
+
+
+def agent_instructions(display, scope, tools=None):
+    lines = [AGENT_REFERENCE, 'Source: ' + json.dumps(display, ensure_ascii=False)]
+    if scope == 'project':
+        lines += ['Locate the repository/worktree root containing this .codex/agents definition,',
+                  'even when the working directory is nested. Resolve Source from that root.']
+    else:
+        lines += ['Source is an absolute path within the selected personal scope.']
+    lines += ['Before performing this task, read Source and follow its Markdown instruction body.',
+              'Do not treat its YAML metadata as Codex configuration. If Source is missing or',
+              'unreadable, report that limitation and ask for reconciliation before proceeding.',
+              'Keep dependencies in their original context: resolve relative Markdown links and',
+              'file-relative imports from the source directory; resolve repository context paths',
+              'from the project root (personal context paths from the selected home).',
+              'Reading the file does not activate Claude loaders, hooks, or execution controls.',
+              'Report unavailable tools or capabilities; do not fabricate results, infer MCP',
+              'mappings, or silently substitute capabilities. Native Codex permissions apply.']
+    if tools is not None:
+        lines += ['Reviewed Claude tools declaration: ' + json.dumps(tools, ensure_ascii=False),
+                  'The user accepted this reference with Codex native permissions. The Claude',
+                  'tools allowlist is NOT translated or enforced; this is not permission to',
+                  'perform external actions or bypass native approvals.']
+    return '\n'.join(lines) + '\n'
 STANDARD_SKILL_FIELDS = {'name', 'description', 'license', 'compatibility', 'metadata', 'allowed-tools'}
 # allowed-tools is optional in the open standard, but its enforcement is provider-specific.
 CONTROLS = {'allowed-tools', 'tools', 'disallowedTools', 'model', 'context', 'agent',
@@ -163,6 +199,10 @@ class Resources:
                 raise self.error(f'{path}: {exc}') from exc
             name = fields.get('name', path.stem)
             parsed.append((path, fields, body, reason, name))
+        if kind == 'agents':
+            unknown = self.sync.accepted_agents - {entry[4] for entry in parsed}
+            if unknown:
+                raise self.error('Unknown --accept-agent-reference names: ' + ', '.join(sorted(unknown)))
         counts = Counter(entry[4] for entry in parsed)
         for path, fields, body, reason, name in parsed:
             if counts[name] > 1:
@@ -218,41 +258,62 @@ class Resources:
         self.record(path, 'shared-native', 'Instruction-only command becomes an Agent Skill; Claude invocation uses its skill discovery link', target / 'SKILL.md')
 
     def agent(self, path, fields, body, reason, name):
-        unknown = set(fields) - {'name', 'description', 'model'}
+        unknown = set(fields) - {'name', 'description', 'model', 'tools'}
         reason = reason or (f'Unsupported agent controls: {", ".join(sorted(unknown))}' if unknown else None)
         reason = reason or ('Model override has no implemented equivalent' if fields.get('model', 'inherit') != 'inherit' else None)
         reason = reason or ('Agent needs name, description, and instructions' if not fields.get('name') or not fields.get('description') or not body.strip() else None)
         reason = reason or (None if NAME.fullmatch(name) and len(name) <= 64 else 'Unsupported agent name')
+        tools = fields.get('tools')
+        if tools is not None and not all(re.fullmatch(r'[A-Za-z_][A-Za-z0-9_.*-]*', tool.strip()) for tool in tools.split(',')):
+            reason = reason or 'Agent tools require a flat comma-separated declaration'
         if reason:
             self.reference(path, 'Agent', reason, conflict=True)
             return
         target = self.sync.base / '.codex/agents' / (name + '.toml')
+        prior_sources = self.agent_sources.get(path, [])
+        if any(prior != target for prior in prior_sources):
+            self.reference(path, 'Agent', 'Agent source name or destination changed; reconcile explicitly',
+                           conflict=True, destination=next(prior for prior in prior_sources if prior != target))
+            return
         if name in BUILTINS or name in self.sync.agent_names:
             self.reference(path, 'Agent', 'Codex agent name collision; choose the source explicitly', conflict=True, destination=target)
             return
-        reason = dependency(body)
-        if reason:
-            self.reference(path, 'Agent', reason, conflict=True, destination=target)
-            return
-        wanted = {'name': name, 'description': fields['description'], 'developer_instructions': body}
+        display = path.relative_to(self.sync.base).as_posix() if self.sync.scope == 'project' else str(path)
+        wanted = {'name': name, 'description': fields['description'],
+                  'developer_instructions': agent_instructions(display, self.sync.scope, tools)}
         self.sync.safe_parent(target); self.sync.observe(target)
+        matching = False
+        doc = self.toml().document()
         if self.exists(target):
             if target.is_symlink() or not target.is_file():
                 self.reference(path, 'Agent', 'Codex agent target is linked or not a file', conflict=True, destination=target)
                 return
             try:
-                current = self.toml().parse(target.read_text()).unwrap()
+                doc = self.toml().parse(target.read_text())
+                current = doc.unwrap()
             except ValueError as exc:
                 raise self.error(f'Malformed Codex agent configuration: {target}') from exc
-            if current != wanted:
+            matching = all(current.get(key) == value for key, value in wanted.items())
+            legacy = current == {'name': name, 'description': fields['description'], 'developer_instructions': body}
+            if not matching and not legacy:
                 self.reference(path, 'Agent', 'Agent definitions differ; select and reconcile the source explicitly', conflict=True, destination=target)
                 return
-        else:
-            doc = self.toml().document()
+        if tools is not None and not matching and name not in self.sync.accepted_agents:
+            warning = 'Claude tools allowlist is not translated or enforced; Codex uses its existing native permissions'
+            approved = self.sync.review_agent and self.sync.review_agent(name, path, target, tools, warning)
+            if not approved:
+                self.reference(path, 'Agent', warning + '; approve the named reference with --accept-agent-reference ' + name,
+                               conflict=True, destination=target)
+                return
+        if not matching:
             for key, value in wanted.items():
                 doc[key] = value
             self.sync.write(target, self.toml().dumps(doc))
-        self.record(path, 'native-adaptation', 'Prompt and description adapted to a native Codex agent; omitted model inherits Codex settings; future edits require explicit sync', target)
+        explanation = 'Native Codex agent reads the original Claude prompt; body edits are shared without regeneration; metadata changes require sync and reconciliation'
+        if tools is not None:
+            explanation += '; reviewed Claude tools allowlist is not translated or enforced; native Codex permissions apply'
+        self.record(path, 'native-reference', explanation, target)
+        self.references.append(f'When a task matches the {json.dumps(name)} agent ({json.dumps(fields["description"], ensure_ascii=False)}), use the native Codex agent {json.dumps(name)}. It reads {json.dumps(display, ensure_ascii=False)} before acting. Native Codex permissions apply; Claude execution controls are not activated.')
 
     def rules(self):
         for path in self.files('rules', {'.md'}):
@@ -286,6 +347,7 @@ class Resources:
         native = self.sync.base / '.codex/agents'
         self.sync.safe_parent(native / 'placeholder')
         self.sync.agent_names = set()
+        self.agent_sources = {}
         config = self.sync.base / '.codex/config.toml'
         if config.is_file():
             agents = self.toml().parse(config.read_text()).get('agents', {})
@@ -297,6 +359,18 @@ class Resources:
                     self.sync.issue(f'Linked native agent (preserved): {path}')
                     continue
                 doc = self.toml().parse(path.read_text())
+                source = agent_source(doc.get('developer_instructions'))
+                if source is not None:
+                    source = Path(source) if self.sync.scope == 'global' else self.sync.base / source
+                    source = Path(source.absolute())
+                    directory = self.sync.base / '.claude/agents'
+                    if not source.is_relative_to(directory) or '..' in source.parts:
+                        self.sync.issue(f'Agent reference outside selected Claude agents (preserved): {path}')
+                    else:
+                        self.agent_sources.setdefault(source, []).append(path)
+                        if not source.is_file():
+                            self.record(source, 'conflict', 'Native reference agent source is missing; definition preserved', path)
+                            self.sync.issue(f'Missing Claude agent source (definition preserved): {source}, {path}')
                 if doc.get('name') and path.stem != doc['name']:
                     self.sync.agent_names.add(doc['name'])
         self.definitions('commands')

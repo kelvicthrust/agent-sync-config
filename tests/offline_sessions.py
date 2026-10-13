@@ -20,6 +20,8 @@ SCRIPT = ROOT / "skills/agent-sync-config/scripts/agent_sync_config.py"
 
 class MockAPI(BaseHTTPRequestHandler):
     requests = []
+    reference_spawned = False
+    reference_received = threading.Event()
 
     def log_message(self, *args):
         pass
@@ -66,6 +68,15 @@ class MockAPI(BaseHTTPRequestHandler):
         self.event("message_stop", {"type": "message_stop"})
 
     def openai_stream(self, body):
+        serialized = json.dumps(body)
+        if 'agent-sync-config:claude-agent-reference\\nSource:' in serialized:
+            self.reference_received.set()
+        if 'OFFLINE_REFERENCE_AGENT_SPAWN' in serialized and not self.reference_spawned:
+            type(self).reference_spawned = True
+            self.spawn_reference(body)
+            return
+        if 'OFFLINE_REFERENCE_AGENT_SPAWN' in serialized:
+            self.reference_received.wait(5)
         response = {"id": "resp_fixture", "object": "response", "created_at": int(time.time()),
                     "model": body.get("model", "fixture"), "status": "in_progress", "output": [], "usage": None}
         item = {"id": "msg_fixture", "type": "message", "role": "assistant", "status": "in_progress", "content": []}
@@ -81,6 +92,29 @@ class MockAPI(BaseHTTPRequestHandler):
         self.event("response.output_item.done", {"type": "response.output_item.done", "output_index": 0, "item": item})
         response = {**response, "status": "completed", "output": [item],
                     "usage": {"input_tokens": 100, "output_tokens": 2, "total_tokens": 102}}
+        self.event("response.completed", {"type": "response.completed", "response": response})
+
+    def spawn_reference(self, body):
+        # Drive one real native spawn through the stub; no real model is involved.
+        tool = next(tool for tool in body['tools'] if tool.get('name') == 'spawn_agent' or
+                    any(child.get('name') == 'spawn_agent' for child in tool.get('tools', [])))
+        item = {"id": "fc_fixture", "type": "function_call", "call_id": "call_fixture_spawn",
+                "name": "spawn_agent", "arguments": json.dumps({"agent_type": "fixture-reviewer",
+                "message": "Review the disposable fixture without tools or external actions."}), "status": "completed"}
+        if tool.get('type') == 'namespace':
+            item['namespace'] = tool['name']
+        response = {"id": "resp_spawn", "object": "response", "created_at": int(time.time()),
+                    "model": body.get("model", "fixture"), "status": "in_progress", "output": [], "usage": None}
+        self.event("response.created", {"type": "response.created", "response": response})
+        self.event("response.output_item.added", {"type": "response.output_item.added", "output_index": 0,
+                   "item": {**item, "arguments": "", "status": "in_progress"}})
+        self.event("response.function_call_arguments.delta", {"type": "response.function_call_arguments.delta",
+                   "item_id": item['id'], "output_index": 0, "delta": item['arguments']})
+        self.event("response.function_call_arguments.done", {"type": "response.function_call_arguments.done",
+                   "item_id": item['id'], "output_index": 0, "arguments": item['arguments']})
+        self.event("response.output_item.done", {"type": "response.output_item.done", "output_index": 0, "item": item})
+        response = {**response, "status": "completed", "output": [item],
+                    "usage": {"input_tokens": 100, "output_tokens": 20, "total_tokens": 120}}
         self.event("response.completed", {"type": "response.completed", "response": response})
 
 
@@ -124,7 +158,7 @@ def main():
             commands = repo / ".claude/commands"; commands.mkdir(parents=True)
             (commands / "command-review.md").write_text("MIGRATED_COMMAND_BODY_SENTINEL\nReview changes.\n")
             agents = repo / ".claude/agents"; agents.mkdir(parents=True)
-            (agents / "fixture-reviewer.md").write_text("---\nname: fixture-reviewer\ndescription: NATIVE_REVIEWER_DISCOVERY_SENTINEL\n---\nReview changes.\n")
+            (agents / "fixture-reviewer.md").write_text("---\nname: fixture-reviewer\ndescription: NATIVE_REVIEWER_DISCOVERY_SENTINEL\ntools: Read, Grep, mcp__example__lookup\n---\nRead @context/notes.md.\nPROMPT_BODY_NOT_AUTOMATICALLY_INJECTED\n")
             rules = repo / ".claude/rules"; rules.mkdir(parents=True)
             (rules / "fixture-rule.md").write_text('---\npaths: ["src/**"]\n---\nRULE_BODY_NOT_AUTOMATICALLY_INJECTED\n')
             (home / ".codex").mkdir()
@@ -143,7 +177,8 @@ def main():
                                 "args": [str(ROOT / "tests/fixtures/mcp_server.py")]}}}))
             subprocess.run([sys.executable, str(SCRIPT), "--scope", "global", "--home", str(home)],
                            env=env, check=True, stdout=subprocess.DEVNULL)
-            subprocess.run([sys.executable, str(SCRIPT), "--scope", "project", "--home", str(home), "--project", str(repo)],
+            subprocess.run([sys.executable, str(SCRIPT), "--scope", "project", "--home", str(home), "--project", str(repo),
+                            "--accept-agent-reference", "fixture-reviewer"],
                            env=env, check=True, stdout=subprocess.DEVNULL)
             config = home / ".codex/config.toml"
             config.write_text(f'model = "fixture"\nmodel_provider = "fixture"\n'
@@ -163,7 +198,14 @@ def main():
                 assert all(token in serialized for token in ("PROJECT_INSTRUCTIONS_SENTINEL", "PERSONAL_INSTRUCTIONS_SENTINEL"))
                 assert "fixture_echo" in serialized, "Codex did not connect to the local MCP fixture"
                 assert "fixture-rule.md" in serialized and "RULE_BODY_NOT_AUTOMATICALLY_INJECTED" not in serialized
-                assert all(marker in serialized for marker in ("NATIVE_REVIEWER_DISCOVERY_SENTINEL", "PERSONAL_REVIEWER_DISCOVERY_SENTINEL")), "Codex did not load the adapted agent catalog"
+                assert all(marker in serialized for marker in ("NATIVE_REVIEWER_DISCOVERY_SENTINEL", "PERSONAL_REVIEWER_DISCOVERY_SENTINEL")), "Codex did not load the reference agent catalog"
+                spawned, _ = session([*command, "OFFLINE_REFERENCE_AGENT_SPAWN"], env, repo, setup_skill=False)
+                assert MockAPI.reference_received.is_set(), "Native spawn did not deliver the reference agent instructions"
+                child = next(body for _, body in spawned if 'agent-sync-config:claude-agent-reference\\nSource:' in json.dumps(body))
+                child_text = json.dumps(child)
+                assert '.claude/agents/fixture-reviewer.md' in child_text
+                assert 'NOT translated or enforced' in child_text
+                assert 'PROMPT_BODY_NOT_AUTOMATICALLY_INJECTED' not in child_text
                 migrated, _ = session([*command, f"[$command-review]({repo / '.agents/skills/command-review/SKILL.md'})"], env, repo, setup_skill=False)
                 assert "MIGRATED_COMMAND_BODY_SENTINEL" in json.dumps(migrated), "Codex did not load the migrated command skill"
                 assert not link.exists(), "A Codex read-only session repaired managed resources"
@@ -173,7 +215,7 @@ def main():
                 resumed, _ = session([*command, "resume", "--last", f"[$agent-sync-config]({home / '.agents/skills/agent-sync-config/SKILL.md'}) check"], env, repo)
                 assert "agent-sync-config" in json.dumps(resumed)
                 assert not link.exists()
-                report["codex"] = "instructions, installed and migrated skill loading, project/global adapted agent catalog, conditional references, MCP, read-only behavior, and resume passed"
+                report["codex"] = "instructions, installed/migrated skills, project/global reference agent catalog, native spawn source-reference delivery, conditional references, MCP, read-only behavior, and resume passed"
             if args.claude:
                 if link.is_symlink():
                     link.unlink()

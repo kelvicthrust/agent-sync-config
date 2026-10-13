@@ -17,7 +17,7 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import claude_resources
 
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 NAME = "agent-sync-config"
 BEGIN = "<!-- agent-sync-config:start -->"
 END = "<!-- agent-sync-config:end -->"
@@ -48,6 +48,23 @@ SKILL_NAME = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 
 class ConfigError(Exception):
     pass
+
+
+class Cancelled(Exception):
+    pass
+
+
+def review_agent(name, source, target, tools, warning):
+    print(f"Agent reference review: {name}\nSource: {source}\nDestination: {target}\nClaude tools: {tools}\n{warning}.")
+    try:
+        choice = input("Approve this named reference, skip, or cancel all changes [a/s/c]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        choice = "c"
+    if choice in {"c", "cancel", "q", ""}:
+        raise Cancelled()
+    if choice not in {"a", "approve", "s", "skip"}:
+        raise ConfigError("Choose approve, skip, or cancel; no changes made")
+    return choice in {"a", "approve"}
 
 
 def exists(path: Path) -> bool:
@@ -288,13 +305,15 @@ def import_server(native: dict, provider: str) -> dict:
 
 
 class Sync:
-    def __init__(self, home: Path, root: Path | None, apply: bool, scope="project"):
+    def __init__(self, home: Path, root: Path | None, apply: bool, scope="project", accepted_agents=None, review_agent=None):
         self.home, self.root, self.apply, self.scope = home, root, apply, scope
         self.base = home if scope == "global" else root
         self.issues, self.changes, self.notes = [], [], []
         self.resources, self.references = [], []
         self.edits = []
         self.observed = {}
+        self.accepted_agents = set(accepted_agents or [])
+        self.review_agent = review_agent
         if scope == "project" and (root == home or exists(root / ".agent-sync.json") or any(root.is_relative_to(home / name)
                 for name in (".agents", ".claude", ".codex", "agent-config"))):
             raise ConfigError("Choose a project outside personal/global configuration, or use --scope global")
@@ -679,6 +698,8 @@ def main(argv=None):
     parser.add_argument("--import-skill", type=Path, help="Adopt an ordinary self-contained skill into the selected scope")
     parser.add_argument("--import-mcp", type=Path, help="Import native Claude-format mcpServers into the selected scope")
     parser.add_argument("--mcp-source", choices=("codex", "claude"), help="Explicitly resolve differing portable native MCP definitions")
+    parser.add_argument("--accept-agent-reference", action="append", default=[], metavar="NAME",
+                        help="Approve one named Claude agent reference using Codex native permissions; repeat for multiple agents; never overwrite conflicts")
     parser.add_argument("--personal-root", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--purge-shared-sources", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--yes", action="store_true", help=argparse.SUPPRESS)
@@ -688,6 +709,8 @@ def main(argv=None):
     apply = args.action != "check" and not args.read_only and not args.dry_run
     try:
         if args.action == "hook":
+            if args.accept_agent_reference:
+                raise ConfigError("--accept-agent-reference requires sync, not hook")
             return 0
         if args.action in {"remove-skill", "uninstall"} or args.purge_shared_sources or args.yes:
             raise ConfigError("Lifecycle commands are retired. Use your skill installer (npx skills remove) for removal; inspect and reconcile legacy configuration explicitly. No files changed.")
@@ -705,6 +728,10 @@ def main(argv=None):
             raise ConfigError("--project cannot be used with --scope global")
         if args.import_mcp and args.mcp_source:
             raise ConfigError("Choose --import-mcp or --mcp-source, not both")
+        if args.accept_agent_reference and (args.action != "sync" or args.read_only):
+            raise ConfigError("--accept-agent-reference requires sync; checks never accept approvals")
+        if any(not SKILL_NAME.fullmatch(name) or len(name) > 64 for name in args.accept_agent_reference):
+            raise ConfigError("--accept-agent-reference needs a lowercase hyphenated agent name")
         home = args.home.expanduser().resolve()
         if scope != "global":
             root = root_for(args.project or Path.cwd())
@@ -730,7 +757,8 @@ def main(argv=None):
                     raise ConfigError("Global scope does not accept --project; rerun with --scope global")
         if scope == "global":
             root = None
-        result = Sync(home, root, apply, scope).run(args.import_skill, args.import_mcp, args.mcp_source)
+        interactive_review = review_agent if apply and not args.json and sys.stdin.isatty() and sys.stdout.isatty() else None
+        result = Sync(home, root, apply, scope, args.accept_agent_reference, interactive_review).run(args.import_skill, args.import_mcp, args.mcp_source)
         report = {"version": VERSION, "scope": scope, "project": str(root) if root else None,
                   "read_only": not apply, "changes": result.changes, "issues": result.issues, "notes": result.notes, "resources": result.resources}
         if args.json:
@@ -745,6 +773,9 @@ def main(argv=None):
             if not result.issues and not result.changes:
                 print("Configuration is synchronized.")
         return 1 if result.issues or (not apply and result.changes and not args.dry_run) else 0
+    except Cancelled:
+        print("Cancelled; no changes made.")
+        return 0
     except (ConfigError, OSError, ValueError, TypeError, KeyError) as exc:
         message = str(exc) if isinstance(exc, ConfigError) else type(exc).__name__
         if args.json:

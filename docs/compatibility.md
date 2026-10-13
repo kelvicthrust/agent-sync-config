@@ -45,12 +45,20 @@ Future client versions must be reviewed rather than inferred from this record.
   reading guidance, not a simulated loader. Support plain/quoted path strings and
   simple string lists. Complex/unknown conditions require review, never unconditional
   injection. This is model guidance rather than automatic enforcement.
-- **Native agent adaptation:** `.codex/agents/*.toml` is the current native format.
-  Translate name, description, and instruction body; omit `model: inherit` so Codex
-  inherits its own settings. Retain Claude originals. Other controls or complex YAML
-  block adaptation; do not replace restrictions with prose. Built-in names
-  `default`, `worker`, and `explorer` are protected. Existing differing definitions
-  need source selection; without history, neither side is presumed authoritative.
+- **Native reference agents:** `.codex/agents/*.toml` is the current native format;
+  name, description, and developer_instructions are required. Keep the prompt in
+  `.claude/agents` and use developer_instructions to direct source reading before
+  acting. Omit `model: inherit` so Codex inherits its own settings. Ordinary source
+  paths retain their original context; body edits require no regeneration. This
+  is model-driven reading, not a native Markdown loader or automatic body injection.
+  Flat `tools` metadata is allowed only after named acceptance that Codex's native
+  permissions apply and Claude's allowlist is not translated/enforced. Other controls
+  and complex YAML remain blocked; no MCP aliases, services, or permissions are inferred.
+  Built-in `default`, `worker`, and `explorer` names are protected. Matching generated
+  fields allow additional native settings; differing fields/tool declarations require
+  reconciliation, never forced by approval. Exact three-field copied-body adapters
+  can upgrade; edited or extended adapters remain conflicts. The generated usable
+  definition records its source and reviewed declaration, without separate state.
 - **Workflows/styles:** retain Claude resources and conditionally reference useful
   content. Reading JavaScript does not run Claude's orchestration API. Reading style
   instructions does not select a native style or replace Codex's system prompt.
@@ -75,6 +83,13 @@ relocation, read-only behavior, native output allowlists, and scope snapshots.
 Native tests must distinguish filesystem reconciliation, client catalog/loading,
 and real-model compliance. Local protocol stubs can prove loading; they cannot
 prove that a model will follow every referenced rule or reproduce orchestration.
+
+The 0.7.0 review confirmed the native three-field agent format and Claude's distinct
+tool controls against the official agent sources above. Tests on Codex 0.162.0 and
+Claude 2.1.295 verified native catalog discovery, retained originals, and source
+reference delivery to a scripted native spawn. Prompt reading remains model-driven;
+the stub does not establish compliance or allowlist equivalence. See the measured
+0.7.0 results in testing.md for Python 3.9, scope isolation, installation, and checks.
 
 Before releasing an integration change, record the tested client/interpreter
 versions, affected native loading evidence, relevant limitations, and suite/check

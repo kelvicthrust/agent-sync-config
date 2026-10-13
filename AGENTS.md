@@ -36,6 +36,11 @@ Use Python 3.9+ on macOS/Linux. The shipped skill is in
   dependencies, or new configuration roots to simulate parity.
 - Use focused tests while editing; run the full suite once after the implementation
   settles. Separate native discovery/loading evidence from model compliance.
+- Claude agents keep one Markdown prompt source. Native Codex reference agents
+  read it before acting; do not copy bodies or claim automatic injection. Flat
+  tool declarations require named review because Claude allowlists are not enforced
+  by Codex. Never turn other execution controls into advisory substitutes or infer
+  permission for service connections. Preserve differing definitions and native settings.
 
 ## Commits and pushes
 

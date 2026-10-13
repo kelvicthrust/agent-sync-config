@@ -73,9 +73,11 @@ Ordinary sync performs supported sharing and adaptation automatically. Do not ad
 - Commands with arguments, shell preprocessing, execution controls, plugin
   variables, nested names, or unsafe relocation dependencies remain reference-only.
 - Simple Claude agents retain their originals and get native `.codex/agents/*.toml`
-  counterparts. Only flat name/description and optional model: inherit are adapted.
-  Complex metadata, unknown fields, execution controls, dependencies, built-in
-  name collisions, and differing existing definitions require explicit review.
+  reference definitions. Flat name/description and optional model: inherit qualify.
+  Codex reads the current original instruction body before acting; ordinary context
+  paths retain their source context. Body edits need no regeneration. Complex
+  metadata, model overrides, other execution controls, built-in names, external
+  links, and differing native definitions remain conflicts.
 - Claude rules, workflows, and output styles stay in `.claude`. Generated guidance
   in shared instructions tells Codex when to consult them, retaining rule conditions.
   These are content references, not activation of Claude loaders or execution controls.
@@ -83,17 +85,43 @@ Ordinary sync performs supported sharing and adaptation automatically. Do not ad
 - Settings, hooks, plugins, memory, and credentials remain provider-specific.
   Do not reference them as portable instructions or emulate their controls.
 
-Use the report's `resources` entries to explain shared native behavior, native
-adaptation, and content references with limitations. Informational limitations do
-not fail sync; conflicts and unresolved adaptations return 1. If either adapted
-agent definition changes, report both paths and ask which source to keep; never
-infer ownership or which edit is newer. Reconcile only with explicit authorization.
+Use the report's `resources` entries to explain shared native behavior,
+native reference agents, and review-only content references. Informational
+limitations do not fail sync; conflicts and unresolved adaptations return 1.
+Metadata, tool declarations, or generated native fields that differ need source
+selection; body edits are shared through reading. Preserve additional native
+settings. Missing original prompts are reported; native definitions are not deleted.
+Never infer ownership or which edit is newer. Reconcile only with authorization.
 Do not claim that filesystem conversion proves model compliance. Native agent
 support depends on the client's version and existing controls.
 
 Do not invent `.agents/rules`, `.agents/agents`, a workflow runtime, or copy this
 skill into a target project. Project references stay repository-relative; global
 references stay within the explicit personal scope. Ordinary sync remains offline.
+
+### Review tool-bearing agents
+
+For agent-bearing repositories, preview with `--dry-run --json` before sync. If a
+report requests review of a flat Claude `tools` declaration, show the named source
+and destination and explain: the Claude allowlist is **not translated or enforced**;
+the reference agent uses existing native Codex permissions. Approval does not
+authorize external actions, connect services, or bypass native trust/approvals.
+Ask whether to approve those named references, skip them, or cancel. Honor an
+existing explicit approval; do not infer blanket acceptance from a sync request.
+After approval, pass each accepted name to the same sync command:
+
+```sh
+python3 <skill-directory>/scripts/agent_sync_config.py --scope project --project <repository> \
+  --accept-agent-reference performance-coach
+```
+
+The option is repeatable and works in explicit global scope too. JSON/noninteractive
+sync never prompts; unapproved agents return 1 while unrelated resources can sync.
+Interactive terminal sync offers named review before writes; cancellation writes
+nothing. Checks never accept approvals or write. Dry runs may preview named
+approvals. Matching reference definitions need no renewed approval. Changed tools
+or native generated fields remain conflicts even with this option; it never forces
+an overwrite. Do not claim the original Claude allowlist protects the Codex agent.
 
 ## MCP
 
