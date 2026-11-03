@@ -1,5 +1,20 @@
 # agent-sync-config
 
+> **Retired:** Development has moved to the private
+> [Agent Toolkit](https://github.com/kelvicthrust/agent-toolkit). This public
+> repository and its releases are frozen; no further public updates are planned.
+> Existing installations and pinned releases remain usable. With authenticated
+> access to Agent Toolkit, switch the installation source after its migration
+> merges:
+>
+> ```sh
+> npx skills add kelvicthrust/agent-toolkit \
+>   --skill agent-sync-config -g -a codex -a claude-code
+> ```
+>
+> Installation does not run global synchronization. The original usage and
+> historical documentation below describe the frozen public version.
+
 [![skills.sh](https://skills.sh/b/kelvicthrust/agent-sync-config)](https://skills.sh/kelvicthrust/agent-sync-config)
 
 Share instructions, skills, context, and compatible Claude resources between
